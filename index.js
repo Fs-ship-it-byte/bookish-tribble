@@ -1,6 +1,12 @@
-const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
+const express = require('express');
 const axios = require('axios');
 const puppeteer = require('puppeteer');
+const { URL } = require('url');
+
+// URL pública donde queda expuesto este addon (ver más abajo). Se usa para
+// construir las URLs del proxy de HLS que le entregamos al reproductor.
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
 
 const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
 
@@ -104,6 +110,104 @@ const EMBED_HOSTS = [
 
 function patchDtoE(url) {
     return url.replace(/\/d\/([A-Za-z0-9]+)(\?|$|#)/, '/e/$1$2').replace(/\/d\/([A-Za-z0-9]+)$/, '/e/$1');
+}
+
+// ==========================================
+// PROXY DE HLS (m3u8 + segmentos)
+// ==========================================
+// Por qué existe esto: el master.m3u8 de hgplaycdn/hglamioz/etc lleva un token
+// atado a la IP y a los headers (Referer/Origin/UA) que lo "negociaron". Si le
+// entregamos esa URL cruda al reproductor (VLC, celular, PC), la petición sale
+// desde OTRA IP y el CDN la rechaza aunque los headers estén bien puestos.
+// Solución: nuestro propio servidor reproxea TODO (m3u8 y cada segmento .ts),
+// siempre con la misma IP/headers, y el reproductor solo habla con nosotros.
+
+function encodeProxyToken(url, headers) {
+    return Buffer.from(JSON.stringify({ url: url, headers: headers || {} }), 'utf8').toString('base64url');
+}
+
+function decodeProxyToken(token) {
+    try {
+        return JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+    } catch (e) { return null; }
+}
+
+// Construye la URL absoluta de nuestro proxy que le vamos a dar a Stremio/VLC
+// en vez de la URL cruda del CDN.
+function buildProxyPlaylistUrl(targetUrl, headers) {
+    const token = encodeProxyToken(targetUrl, headers);
+    return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
+}
+
+function isM3u8Url(u) {
+    return /\.m3u8(\?|#|$)/i.test(u);
+}
+
+// Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
+// a apuntar a nuestro propio proxy, conservando los headers originales.
+function rewriteM3u8(playlistText, baseUrl, headers) {
+    const lines = playlistText.split(/\r?\n/);
+    const out = lines.map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+
+        // Reescribir atributos URI="..." (ej: #EXT-X-KEY, #EXT-X-MAP)
+        if (trimmed.startsWith('#')) {
+            return line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                const token = encodeProxyToken(abs, headers);
+                return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
+            });
+        }
+
+        // Línea de URI de segmento o sub-playlist
+        const absUrl = /^https?:\/\//i.test(trimmed)
+            ? trimmed
+            : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
+        const token = encodeProxyToken(absUrl, headers);
+        return isM3u8Url(absUrl)
+            ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
+            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+    });
+    return out.join('\n');
+}
+
+async function handleHlsPlaylistProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+
+    try {
+        const upstream = await axios.get(data.url, {
+            headers: data.headers,
+            timeout: 15000,
+            responseType: 'text',
+            transformResponse: [(d) => d]
+        });
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+    } catch (e) {
+        res.status(502).send('No se pudo obtener el playlist');
+    }
+}
+
+async function handleHlsSegmentProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+
+    try {
+        const upstream = await axios.get(data.url, {
+            headers: data.headers,
+            timeout: 20000,
+            responseType: 'stream'
+        });
+        res.set('Access-Control-Allow-Origin', '*');
+        if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
+        upstream.data.pipe(res);
+    } catch (e) {
+        res.status(502).send('No se pudo obtener el segmento');
+    }
 }
 
 function isEmbedHost(url) {
@@ -626,15 +730,16 @@ builder.defineStreamHandler(async (args) => {
             directUrl = await resolveVidHideHls(s.playerUrl);
             
             if (directUrl) {
+                // Reproxeamos también acá: mismo motivo que abajo (token atado a IP/headers).
                 return {
                     name: "PoseidonHD",
                     description: cleanLabel,
-                    url: directUrl
+                    url: buildProxyPlaylistUrl(directUrl, { 'User-Agent': PS_UA['User-Agent'] })
                 };
             }
         }
 
-        // 2. Resolver Embeds (Streamwish, Medixiru, etc) inyectando cabeceras de proxy
+        // 2. Resolver Embeds (Streamwish, Medixiru, etc)
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
             // 2a. Intento rápido (sin navegador): sirve para hosts que sí redirigen
@@ -644,13 +749,7 @@ builder.defineStreamHandler(async (args) => {
                 return {
                     name: "PoseidonHD",
                     description: cleanLabel + "\n(Directo)",
-                    url: swDataFast.url,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: swDataFast.headers
-                        }
-                    }
+                    url: buildProxyPlaylistUrl(swDataFast.url, swDataFast.headers)
                 };
             }
 
@@ -659,16 +758,14 @@ builder.defineStreamHandler(async (args) => {
             //     m3u8 solo ocurren ejecutando el JS real del sitio.
             const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
             if (swDataBrowser && swDataBrowser.url) {
+                // IMPORTANTE: no le pasamos la URL cruda de hgplaycdn al reproductor.
+                // El token del m3u8 quedó atado a la IP/headers con los que
+                // Puppeteer lo negoció; si el celular/PC la pide directo, el CDN
+                // la rechaza. Por eso TODO pasa por nuestro propio proxy.
                 return {
                     name: "PoseidonHD",
                     description: cleanLabel + "\n(Directo)",
-                    url: swDataBrowser.url,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: swDataBrowser.headers
-                        }
-                    }
+                    url: buildProxyPlaylistUrl(swDataBrowser.url, swDataBrowser.headers)
                 };
             }
 
@@ -678,13 +775,7 @@ builder.defineStreamHandler(async (args) => {
                 return {
                     name: "PoseidonHD",
                     description: cleanLabel + "\n(Directo)",
-                    url: directData.url,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: directData.headers
-                        }
-                    }
+                    url: buildProxyPlaylistUrl(directData.url, directData.headers)
                 };
             }
             
@@ -704,8 +795,16 @@ builder.defineStreamHandler(async (args) => {
 });
 
 const port = process.env.PORT || 7000;
-serveHTTP(builder.getInterface(), { port: port });
-console.log(`Addon de Stremio escuchando en puerto ${port}`);
+
+const app = express();
+app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
+app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
+app.use(getRouter(builder.getInterface()));
+
+app.listen(port, () => {
+    console.log(`Addon de Stremio escuchando en puerto ${port}`);
+    console.log(`PUBLIC_URL usada para el proxy de HLS: ${PUBLIC_URL}`);
+});
 
 async function shutdown() {
     if (_browserInstance) {
