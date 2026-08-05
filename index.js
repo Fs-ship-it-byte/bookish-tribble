@@ -547,7 +547,6 @@ builder.defineStreamHandler(async (args) => {
     }));
 
     return { streams: stremioStreams.filter(stream => stream !== null) };
-});
 
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: port });
