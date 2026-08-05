@@ -6,7 +6,92 @@ const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWe
 // ==========================================
 // UTILIDADES Y FUNCIONES PURAS
 // ==========================================
+function unpackJsVh(p, a, c, k) {
+    while (c--) {
+        if (k[c]) p = p.replace(new RegExp('\\b' + c.toString(a) + '\\b', 'g'), k[c]);
+    }
+    return p;
+}
 
+function makeAbsoluteVh(url, base) {
+    if (!url) return null;
+    if (/^https?:\/\//i.test(url)) return url;
+    if (url.indexOf('//') === 0) return 'https:' + url;
+    if (url.indexOf('/') === 0) return base + url;
+    return base + '/' + url;
+}
+
+function parseJsObjVh(str) {
+    try {
+        var clean = str
+            .replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":')
+            .replace(/:\s*'([^']*)'/g, ':"$1"')
+            .replace(/,\s*\}/g, '}');
+        return JSON.parse(clean);
+    } catch(e) {}
+    return null;
+}
+
+function extractM3u8FromObjVh(obj, base) {
+    if (!obj) return null;
+    var keys = Object.keys(obj);
+    for (var i = 0; i < keys.length; i++) {
+        var v = obj[keys[i]];
+        if (v && typeof v === 'string' && v.indexOf('master.m3u8') !== -1) return makeAbsoluteVh(v, base);
+    }
+    for (var j = 0; j < keys.length; j++) {
+        var v2 = obj[keys[j]];
+        if (v2 && typeof v2 === 'string' && v2.indexOf('.m3u8') !== -1) return makeAbsoluteVh(v2, base);
+    }
+    for (var k = 0; k < keys.length; k++) {
+        var v3 = obj[keys[k]];
+        if (v3 && typeof v3 === 'string' && v3.indexOf('/hls/') !== -1) return makeAbsoluteVh(v3, base);
+    }
+    return null;
+}
+
+function extractHlsFromCallistanise(code, base) {
+    var sourceRefM = code.match(/(?:sources?|file)\s*:\s*(?:\[?\s*\{[^}]*(?:file|src)\s*:\s*)?([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*\.\s*([a-zA-Z0-9_]+)\s*\|\|\s*\1\s*\.\s*([a-zA-Z0-9_]+)(?:\s*\|\|\s*\1\s*\.\s*([a-zA-Z0-9_]+))?/i);
+    if (sourceRefM) {
+        var varName = sourceRefM[1];
+        var keys = [sourceRefM[2], sourceRefM[3]];
+        if (sourceRefM[4]) keys.push(sourceRefM[4]);
+        var varRe = new RegExp('var\\s+' + varName.replace('$', '\\$') + '\\s*=\\s*(\\{[\\s\\S]{1,800}?\\})', 'i');
+        var vm = code.match(varRe);
+        if (vm) {
+            var vo = parseJsObjVh(vm[1]);
+            if (vo) {
+                for (var ki = 0; ki < keys.length; ki++) {
+                    var kv = vo[keys[ki]];
+                    if (kv && kv.indexOf('.m3u8') !== -1) return makeAbsoluteVh(kv, base);
+                }
+                var fb = extractM3u8FromObjVh(vo, base);
+                if (fb) return fb;
+            }
+        }
+    }
+
+    var anyVarM = code.match(/var\s+([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*=\s*(\{[^{}]{10,800}\})/g);
+    if (anyVarM) {
+        for (var vi = 0; vi < anyVarM.length; vi++) {
+            var vm2 = anyVarM[vi].match(/var\s+([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*=\s*(\{[^{}]{10,800}\})/);
+            if (!vm2) continue;
+            if (vm2[2].indexOf('m3u8') === -1 && vm2[2].indexOf('/hls/') === -1) continue;
+            var vo2 = parseJsObjVh(vm2[2]);
+            if (!vo2) continue;
+            var found = extractM3u8FromObjVh(vo2, base);
+            if (found) return found;
+        }
+    }
+
+    var fm = code.match(/(?:file)\s*:\s*["']([^"']+\.(?:m3u8|txt)[^"']*?)["']/i);
+    if (fm) return makeAbsoluteVh(fm[1], base);
+    var am = code.match(/(https?:\/\/[^"'\s\\]+\.(?:m3u8|txt)[^"'\s\\]*)/i);
+    if (am) return am[1];
+    return null;
+}
+
+// Añadidos más dominios mutantes de Streamwish
 const EMBED_HOSTS = [
     'streamwish', 'niramirus', 'filemoon', 'embedwish', 'vidhide',
     'vidhideplus', 'wishfast', 'strwish', 'awish', 'flaswish',
@@ -127,8 +212,50 @@ function parseNextData(html) {
 
 
 // ==========================================
-// FUNCIONES ASÍNCRONAS (EXTRACTORES)
+// FUNCIONES ASÍNCRONAS (SCRAPERS)
 // ==========================================
+async function resolveVidHideHls(url) {
+    var fileId = null;
+    var dm = url.match(/https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)/i);
+    if (dm) {
+        fileId = dm[1];
+    } else if (url.indexOf('player.poseidonhd2') !== -1 || url.indexOf('player.php') !== -1) {
+        var playerHtml;
+        try {
+            playerHtml = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
+        } catch(e) { return null; }
+        var m = playerHtml.match(/['"]https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)['"]/i);
+        if (!m) return null;
+        fileId = m[1];
+    } else {
+        return null;
+    }
+
+    var base = 'https://callistanise.com';
+    var calliPaths = ['/embed/', '/v/'];
+    for (var pi = 0; pi < calliPaths.length; pi++) {
+        var calliUrl = base + calliPaths[pi] + fileId;
+        var calliHtml;
+        try {
+            calliHtml = (await axios.get(calliUrl, {
+                headers: { 'User-Agent': PS_UA['User-Agent'], 'Referer': 'https://filelions.to/' },
+                timeout: 8000
+            })).data;
+        } catch(e) { continue; }
+        
+        var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\|'\)\s*\)/im);
+        if (em) {
+            var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
+            var hls = extractHlsFromCallistanise(decoded, base);
+            if (hls) return hls;
+        }
+        var hls2 = extractHlsFromCallistanise(calliHtml, base);
+        if (hls2) return hls2;
+    }
+    return null;
+}
+
+// --- COMIENZA EL CÓDIGO MODIFICADO ---
 
 async function resolveEmbedUrl(poseidonUrl) {
     var html;
@@ -136,31 +263,28 @@ async function resolveEmbedUrl(poseidonUrl) {
         html = (await axios.get(poseidonUrl, { headers: PS_UA, timeout: 8000 })).data;
     } catch(e) { return null; }
 
+    // Regex agresivo: busca cualquier estructura "/e/ID" o "/embed/ID" sin importar el dominio
     var patterns = [
         /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
         /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
-        /<meta[^>]+http-equiv\s*=\s*['"]refresh['""][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
-        /<iframe[^>]+src\s*=\s*['"]([^'"]+)['"]/i,
-        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['""][^>]+content\s*=\s*['"][^'">\\s]+url=([^'">\\s]+)/i,
+        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]​/i,
         /(https?:\/\/[^\s'"<>\\]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^\s'"<>\\]*)/i
     ];
 
     for (var i = 0; i < patterns.length; i++) {
         var m = html.match(patterns[i]);
-        if (m && m[1]) {
-            let url = m[1];
-            if (url.startsWith('//')) url = 'https:' + url;
-            if (url.startsWith('/')) url = new URL(url, poseidonUrl).href;
-            return url;
-        }
+        if (m && m[1]) return m[1];
     }
     return null;
 }
 
+// ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
 async function resolveDirectVideoUrl(embedUrl) {
     try {
+        // Obtenemos la página final (siguiendo redirecciones)
         const res = await axios.get(embedUrl, { 
-            headers: { ...PS_UA, 'Referer': 'https://www.poseidonhd2.co/' }, 
+            headers: { ...PS_UA, 'Referer': 'https://www.google.com/' }, 
             timeout: 10000 
         });
         
@@ -168,7 +292,8 @@ async function resolveDirectVideoUrl(embedUrl) {
         const finalUrl = res.request.res.responseUrl || embedUrl;
         const origin = new URL(finalUrl).origin;
 
-        const evalRegex = /eval\(\s*function\s*\(p,\s*a,\s*c,\s*k,\s*e,\s*[rd]\).*?\}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\s*\.split\('\\|'\)/g;
+        // Intentar unpack (si el sitio está ofuscado)
+        const evalRegex = /eval\(\s*function\s*\(p,a,c,k,e,[rd]\).*?\}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\s*\.split\('\\|'\)/g;
         let match;
         let unpackedHtml = html;
         
@@ -182,14 +307,11 @@ async function resolveDirectVideoUrl(embedUrl) {
             unpackedHtml += "\n" + p;
         }
 
-        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)['"]/i;
-        let linkMatch = unpackedHtml.match(fileRegex);
+        // Buscar enlaces m3u8 o mp4
+        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\\s]+\.(?:m3u8|mp4)[^"'\\s]*)['"]/i;
+        const linkMatch = unpackedHtml.match(fileRegex);
         
-        if (!linkMatch) {
-            linkMatch = unpackedHtml.match(/(https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)/i);
-        }
-
-        if (linkMatch && linkMatch[1]) {
+        if (linkMatch) {
             return {
                 url: linkMatch[1],
                 headers: { "Referer": origin + '/', "Origin": origin, "User-Agent": PS_UA['User-Agent'] }
@@ -200,6 +322,8 @@ async function resolveDirectVideoUrl(embedUrl) {
     }
     return null;
 }
+
+// --- TERMINA EL CÓDIGO MODIFICADO ---
 
 async function searchPoseidon2hd(q) {
     var html;
@@ -339,8 +463,23 @@ builder.defineStreamHandler(async (args) => {
     if (!poseidonData || !poseidonData.streams) return { streams: [] };
 
     const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
+        let directUrl = null;
         let cleanLabel = s.label.replace(' (DL)', '');
         
+        // 1. Resolver VidHide
+        if (s.label.toLowerCase().includes('vidhide')) {
+            directUrl = await resolveVidHideHls(s.playerUrl);
+            
+            if (directUrl) {
+                return {
+                    name: "PoseidonHD",
+                    description: cleanLabel,
+                    url: directUrl
+                };
+            }
+        }
+
+        // 2. Resolver Embeds (Streamwish, Medixiru, etc) inyectando cabeceras de proxy
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
             const directData = await resolveDirectVideoUrl(embedUrl);
@@ -359,6 +498,7 @@ builder.defineStreamHandler(async (args) => {
                 };
             }
             
+            // Backup por si falla la extracción
             return {
                 name: "PoseidonHD",
                 description: cleanLabel + "\n(External Web)",
