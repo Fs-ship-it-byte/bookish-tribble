@@ -216,17 +216,25 @@ function parseNextData(html) {
 // ==========================================
 async function resolveVidHideHls(url) {
     var fileId = null;
-    var dm = url.match(/https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)/i);
-    if (dm) {
-        fileId = dm[1];
+    var originDomain = 'https://vidhideplus.com'; // Dominio de respaldo
+
+    // Detectar el dominio real (vidhide.com, vidhideplus.com, filelions.to, etc.)
+    var dm = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)/i);
+    if (dm) originDomain = dm[0];
+
+    var dmId = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)\/(?:v|e)\/([A-Za-z0-9]+)/i);
+    if (dmId) {
+        fileId = dmId[1];
     } else if (url.indexOf('player.poseidonhd2') !== -1 || url.indexOf('player.php') !== -1) {
         var playerHtml;
         try {
             playerHtml = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
         } catch(e) { return null; }
-        var m = playerHtml.match(/['"]https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)['"]/i);
+        
+        var m = playerHtml.match(/['"](https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+))\/(?:v|e)\/([A-Za-z0-9]+)['"]/i);
         if (!m) return null;
-        fileId = m[1];
+        originDomain = m[1];
+        fileId = m[2];
     } else {
         return null;
     }
@@ -238,19 +246,30 @@ async function resolveVidHideHls(url) {
         var calliHtml;
         try {
             calliHtml = (await axios.get(calliUrl, {
-                headers: { 'User-Agent': PS_UA['User-Agent'], 'Referer': 'https://filelions.to/' },
+                headers: { 'User-Agent': PS_UA['User-Agent'], 'Referer': originDomain + '/' },
                 timeout: 8000
             })).data;
         } catch(e) { continue; }
         
         var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\|'\)\s*\)/im);
+        var hls = null;
         if (em) {
             var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
-            var hls = extractHlsFromCallistanise(decoded, base);
-            if (hls) return hls;
+            hls = extractHlsFromCallistanise(decoded, base);
         }
-        var hls2 = extractHlsFromCallistanise(calliHtml, base);
-        if (hls2) return hls2;
+        if (!hls) hls = extractHlsFromCallistanise(calliHtml, base);
+
+        if (hls) {
+            // Se retorna el enlace y las cabeceras exactas para burlar el bloqueo
+            return {
+                url: hls,
+                headers: {
+                    "Referer": originDomain + '/',
+                    "Origin": originDomain,
+                    "User-Agent": PS_UA['User-Agent']
+                }
+            };
+        }
     }
     return null;
 }
@@ -492,15 +511,21 @@ builder.defineStreamHandler(async (args) => {
         let directUrl = null;
         let cleanLabel = s.label.replace(' (DL)', '');
         
-        // 1. Resolver VidHide
+       // 1. Resolver VidHide
         if (s.label.toLowerCase().includes('vidhide')) {
-            directUrl = await resolveVidHideHls(s.playerUrl);
+            const vidhideData = await resolveVidHideHls(s.playerUrl);
             
-            if (directUrl) {
+            if (vidhideData && vidhideData.url) {
                 return {
                     name: "PoseidonHD",
-                    description: cleanLabel,
-                    url: directUrl
+                    description: cleanLabel + "\n(Directo)",
+                    url: vidhideData.url,
+                    behaviorHints: {
+                        notWebReady: true,
+                        proxyHeaders: {
+                            request: vidhideData.headers
+                        }
+                    }
                 };
             }
         }
