@@ -267,14 +267,89 @@ async function resolveEmbedUrl(poseidonUrl) {
     var patterns = [
         /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
         /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
-        /<meta[^>]+http-equiv\s*=\s*['"]refresh['""][^>]+content\s*=\s*['"][^'">\\s]+url=([^'">\\s]+)/i,
-        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]​/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['"][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
+        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]/i,
         /(https?:\/\/[^\s'"<>\\]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^\s'"<>\\]*)/i
     ];
 
     for (var i = 0; i < patterns.length; i++) {
         var m = html.match(patterns[i]);
         if (m && m[1]) return m[1];
+    }
+    return null;
+}
+
+// Detecta si un HTML de un embed hace una redirección client-side (JS o meta refresh)
+// hacia otro dominio "mutante" (ej: streamwish.to/e/ID -> niramirus.com/e/ID)
+function findMutantRedirect(html, base) {
+    var patterns = [
+        /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
+        /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['"][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
+        /<iframe[^>]+src\s*=\s*['"]([^'"]+\/(?:e|embed)\/[a-zA-Z0-9]+[^'"]*)['"]/i
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+        var m = html.match(patterns[i]);
+        if (m && m[1]) return makeAbsoluteVh(m[1], base);
+    }
+    return null;
+}
+
+// Extrae y desempaqueta cualquier bloque eval(function(p,a,c,k,e,d)...) presente en un HTML
+function unpackEvalBlocks(html) {
+    var evalRegex = /eval\(\s*function\s*\(p,a,c,k,e,[rd]\)[\s\S]*?\}\s*\(\s*'([\s\S]*?)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]*?)'\s*\.split\('\|'\)/g;
+    var match;
+    var unpacked = '';
+    while ((match = evalRegex.exec(html)) !== null) {
+        var p = match[1];
+        var a = parseInt(match[2], 10);
+        var c = parseInt(match[3], 10);
+        var k = match[4].split('|');
+        unpacked += '\n' + unpackJsVh(p, a, c, k);
+    }
+    return unpacked;
+}
+
+// NUEVO: resolvedor específico para la familia Streamwish (streamwish, niramirus,
+// embedwish, vidhideplus-clones, filemoon, etc). Sigue la redirección client-side
+// hasta el dominio "mutante" final y desempaqueta el player para sacar el m3u8 real.
+async function resolveStreamwishHls(embedUrl) {
+    var visited = {};
+    var currentUrl = embedUrl;
+    var refererOrigin = 'https://www.google.com/';
+
+    for (var hop = 0; hop < 4; hop++) {
+        if (visited[currentUrl]) break;
+        visited[currentUrl] = true;
+
+        var res;
+        try {
+            res = await axios.get(currentUrl, {
+                headers: { ...PS_UA, 'Referer': refererOrigin },
+                timeout: 10000
+            });
+        } catch (e) { return null; }
+
+        var html = res.data;
+        var finalUrl = (res.request && res.request.res && res.request.res.responseUrl) || currentUrl;
+        var origin = new URL(finalUrl).origin;
+
+        // 1. Intentar sacar el m3u8 directo del HTML/scripts desempaquetados de esta página
+        var unpacked = unpackEvalBlocks(html);
+        var hls = extractHlsFromCallistanise(unpacked + '\n' + html, origin);
+        if (hls) {
+            return {
+                url: hls,
+                headers: { 'Referer': origin + '/', 'Origin': origin, 'User-Agent': PS_UA['User-Agent'] }
+            };
+        }
+
+        // 2. Si no hay video todavía, ver si la página redirige a un dominio mutante
+        var nextUrl = findMutantRedirect(html, origin);
+        if (!nextUrl || nextUrl === currentUrl) return null;
+
+        currentUrl = nextUrl;
+        refererOrigin = origin + '/';
     }
     return null;
 }
@@ -293,22 +368,11 @@ async function resolveDirectVideoUrl(embedUrl) {
         const origin = new URL(finalUrl).origin;
 
         // Intentar unpack (si el sitio está ofuscado)
-        const evalRegex = /eval\(\s*function\s*\(p,a,c,k,e,[rd]\).*?\}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\s*\.split\('\\|'\)/g;
-        let match;
-        let unpackedHtml = html;
-        
-        while ((match = evalRegex.exec(html)) !== null) {
-            let p = match[1];
-            let a = parseInt(match[2], 10);
-            let c = parseInt(match[3], 10);
-            let k = match[4].split('|');
-            let e = function(c) { return (c < a ? '' : e(Math.floor(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36)); };
-            while (c--) { if (k[c]) p = p.replace(new RegExp('\\b' + e(c) + '\\b', 'g'), k[c]); }
-            unpackedHtml += "\n" + p;
-        }
+        const unpackedExtra = unpackEvalBlocks(html);
+        const unpackedHtml = html + '\n' + unpackedExtra;
 
-        // Buscar enlaces m3u8 o mp4
-        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\\s]+\.(?:m3u8|mp4)[^"'\\s]*)['"]/i;
+        // Buscar enlaces m3u8 o mp4 (regex corregida: \s ya no excluye la letra "s")
+        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)['"]/i;
         const linkMatch = unpackedHtml.match(fileRegex);
         
         if (linkMatch) {
@@ -482,8 +546,25 @@ builder.defineStreamHandler(async (args) => {
         // 2. Resolver Embeds (Streamwish, Medixiru, etc) inyectando cabeceras de proxy
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
+            // 2a. Intento especializado: sigue el/los saltos hacia el dominio "mutante"
+            //     (streamwish.to -> niramirus.com, etc) y desempaqueta el player ahí.
+            const swData = await resolveStreamwishHls(embedUrl);
+            if (swData && swData.url) {
+                return {
+                    name: "PoseidonHD",
+                    description: cleanLabel + "\n(Directo)",
+                    url: swData.url,
+                    behaviorHints: {
+                        notWebReady: true,
+                        proxyHeaders: {
+                            request: swData.headers
+                        }
+                    }
+                };
+            }
+
+            // 2b. Intento genérico (para hosts que no redirigen a otro dominio)
             const directData = await resolveDirectVideoUrl(embedUrl);
-            
             if (directData && directData.url) {
                 return {
                     name: "PoseidonHD",
@@ -498,7 +579,8 @@ builder.defineStreamHandler(async (args) => {
                 };
             }
             
-            // Backup por si falla la extracción
+            // Backup por si falla toda la extracción: si aun así preferís
+            // no mostrar streams "External Web", cambiá el return de abajo por `return null;`
             return {
                 name: "PoseidonHD",
                 description: cleanLabel + "\n(External Web)",
