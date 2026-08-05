@@ -216,9 +216,8 @@ function parseNextData(html) {
 // ==========================================
 async function resolveVidHideHls(url) {
     var fileId = null;
-    var originDomain = 'https://vidhideplus.com'; // Dominio de respaldo
+    var originDomain = 'https://vidhideplus.com';
 
-    // Detectar el dominio real (vidhide.com, vidhideplus.com, filelions.to, etc.)
     var dm = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)/i);
     if (dm) originDomain = dm[0];
 
@@ -251,16 +250,23 @@ async function resolveVidHideHls(url) {
             })).data;
         } catch(e) { continue; }
         
-        var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\|'\)\s*\)/im);
         var hls = null;
-        if (em) {
-            var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
-            hls = extractHlsFromCallistanise(decoded, base);
+        
+        // Bloque seguro: Verifica estrictamente que los grupos existan antes de hacer el split
+        try {
+            var em = calliHtml.match(/\}\s*\(\s*['"]([\s\S]+?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]+?)['"]\s*\.split\(/im);
+            if (em && em[1] && em[4]) {
+                var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
+                hls = extractHlsFromCallistanise(decoded, base);
+            }
+        } catch(ex) {}
+
+        // Fallback si el empaquetado falló o no venía ofuscado de esa forma
+        if (!hls) {
+            hls = extractHlsFromCallistanise(calliHtml, base);
         }
-        if (!hls) hls = extractHlsFromCallistanise(calliHtml, base);
 
         if (hls) {
-            // Se retorna el enlace y las cabeceras exactas para burlar el bloqueo
             return {
                 url: hls,
                 headers: {
