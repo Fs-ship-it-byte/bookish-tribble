@@ -1,5 +1,6 @@
 const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
 const axios = require('axios');
+const puppeteer = require('puppeteer');
 
 const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
 
@@ -354,6 +355,96 @@ async function resolveStreamwishHls(embedUrl) {
     return null;
 }
 
+// ==========================================
+// RESOLUCIÓN CON NAVEGADOR HEADLESS (Puppeteer)
+// ==========================================
+// Necesario porque streamwish.to/e/ID NO redirige por HTTP ni por un
+// window.location.href simple visible en el HTML: el cambio de dominio
+// (ej. -> niramirus.com/e/ID) y la carga del .m3u8 ocurren mediante JS
+// ejecutado en el navegador (fetch/XHR internos, DOM dinámico, etc).
+// axios nunca va a "verlo" porque no ejecuta JavaScript.
+// La única forma confiable es abrir la página en un navegador real
+// (headless) e interceptar la petición de red hacia el .m3u8 cuando
+// el propio player la dispara, tal como pasa cuando lo abrís tú mismo.
+
+let _browserInstance = null;
+async function getBrowser() {
+    if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
+    _browserInstance = await puppeteer.launch({
+        headless: 'new',
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
+        ]
+    });
+    return _browserInstance;
+}
+
+// Resuelve el .m3u8 real abriendo el embed en un navegador headless,
+// siguiendo todos los saltos de dominio que haga el propio JS del sitio,
+// e interceptando la request de red hacia el .m3u8 cuando se dispare.
+async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
+    timeoutMs = timeoutMs || 15000;
+    let browser;
+    let page;
+    try {
+        browser = await getBrowser();
+        page = await browser.newPage();
+        await page.setUserAgent(PS_UA['User-Agent']);
+        await page.setRequestInterception(true);
+
+        let resolved = null;
+        let lastRefererByUrl = 'https://www.google.com/';
+
+        page.on('request', (req) => {
+            const url = req.url();
+            // Cortamos imágenes/fuentes/media pesada innecesaria para acelerar la carga,
+            // pero dejamos pasar todo lo demás (incluyendo el propio .m3u8 y los scripts).
+            const type = req.resourceType();
+            if (type === 'image' || type === 'font' || type === 'media') {
+                req.abort();
+                return;
+            }
+            if (!resolved && /\.m3u8(\?|$)/i.test(url)) {
+                resolved = {
+                    url: url,
+                    headers: {
+                        'Referer': req.headers()['referer'] || lastRefererByUrl,
+                        'Origin': new URL(url).origin,
+                        'User-Agent': PS_UA['User-Agent']
+                    }
+                };
+            }
+            req.continue();
+        });
+
+        page.on('framenavigated', (frame) => {
+            if (frame === page.mainFrame()) {
+                lastRefererByUrl = frame.url();
+            }
+        });
+
+        await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
+
+        // Le damos un margen para que el player dispare el fetch/XHR del m3u8
+        // luego de que el DOM y los scripts terminen de correr.
+        const start = Date.now();
+        while (!resolved && Date.now() - start < timeoutMs) {
+            await new Promise(r => setTimeout(r, 300));
+        }
+
+        return resolved;
+    } catch (e) {
+        return null;
+    } finally {
+        if (page) {
+            try { await page.close(); } catch (e) {}
+        }
+    }
+}
+
 // ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
 async function resolveDirectVideoUrl(embedUrl) {
     try {
@@ -546,24 +637,42 @@ builder.defineStreamHandler(async (args) => {
         // 2. Resolver Embeds (Streamwish, Medixiru, etc) inyectando cabeceras de proxy
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
-            // 2a. Intento especializado: sigue el/los saltos hacia el dominio "mutante"
-            //     (streamwish.to -> niramirus.com, etc) y desempaqueta el player ahí.
-            const swData = await resolveStreamwishHls(embedUrl);
-            if (swData && swData.url) {
+            // 2a. Intento rápido (sin navegador): sirve para hosts que sí redirigen
+            //     con un window.location simple o ya traen el m3u8 en el HTML plano.
+            const swDataFast = await resolveStreamwishHls(embedUrl);
+            if (swDataFast && swDataFast.url) {
                 return {
                     name: "PoseidonHD",
                     description: cleanLabel + "\n(Directo)",
-                    url: swData.url,
+                    url: swDataFast.url,
                     behaviorHints: {
                         notWebReady: true,
                         proxyHeaders: {
-                            request: swData.headers
+                            request: swDataFast.headers
                         }
                     }
                 };
             }
 
-            // 2b. Intento genérico (para hosts que no redirigen a otro dominio)
+            // 2b. Intento con navegador headless: necesario cuando el salto de
+            //     dominio (streamwish.to -> niramirus.com, etc) y la carga del
+            //     m3u8 solo ocurren ejecutando el JS real del sitio.
+            const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
+            if (swDataBrowser && swDataBrowser.url) {
+                return {
+                    name: "PoseidonHD",
+                    description: cleanLabel + "\n(Directo)",
+                    url: swDataBrowser.url,
+                    behaviorHints: {
+                        notWebReady: true,
+                        proxyHeaders: {
+                            request: swDataBrowser.headers
+                        }
+                    }
+                };
+            }
+
+            // 2c. Intento genérico legacy (por si acaso)
             const directData = await resolveDirectVideoUrl(embedUrl);
             if (directData && directData.url) {
                 return {
@@ -597,3 +706,12 @@ builder.defineStreamHandler(async (args) => {
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: port });
 console.log(`Addon de Stremio escuchando en puerto ${port}`);
+
+async function shutdown() {
+    if (_browserInstance) {
+        try { await _browserInstance.close(); } catch (e) {}
+    }
+    process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
