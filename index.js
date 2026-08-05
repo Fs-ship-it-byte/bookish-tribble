@@ -216,7 +216,7 @@ function parseNextData(html) {
 // ==========================================
 async function resolveVidHideHls(url) {
     var fileId = null;
-    var originDomain = 'https://vidhideplus.com';
+    var originDomain = 'https://vidhidepro.com';
 
     var dm = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)/i);
     if (dm) originDomain = dm[0];
@@ -252,7 +252,6 @@ async function resolveVidHideHls(url) {
         
         var hls = null;
         
-        // Bloque seguro: Verifica estrictamente que los grupos existan antes de hacer el split
         try {
             var em = calliHtml.match(/\}\s*\(\s*['"]([\s\S]+?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]+?)['"]\s*\.split\(/im);
             if (em && em[1] && em[4]) {
@@ -261,19 +260,26 @@ async function resolveVidHideHls(url) {
             }
         } catch(ex) {}
 
-        // Fallback si el empaquetado falló o no venía ofuscado de esa forma
         if (!hls) {
             hls = extractHlsFromCallistanise(calliHtml, base);
         }
 
         if (hls) {
+            var finalHls = makeAbsoluteVh(hls, base);
+            
+            // Cabeceras dinámicas según el destino del stream
+            var headers = { "User-Agent": PS_UA['User-Agent'] };
+            if (finalHls.includes('callistanise.com')) {
+                headers["Referer"] = originDomain + '/';
+                headers["Origin"] = originDomain;
+            } else {
+                headers["Referer"] = 'https://callistanise.com/';
+                headers["Origin"] = 'https://callistanise.com';
+            }
+
             return {
-                url: hls,
-                headers: {
-                    "Referer": originDomain + '/',
-                    "Origin": originDomain,
-                    "User-Agent": PS_UA['User-Agent']
-                }
+                url: finalHls,
+                headers: headers
             };
         }
     }
