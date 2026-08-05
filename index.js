@@ -1,4 +1,5 @@
-const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const express = require('express');
+const { addonBuilder } = require('stremio-addon-sdk');
 const axios = require('axios');
 
 const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
@@ -140,7 +141,7 @@ function parseCliLiStreams(html) {
             var serverMatch = text.match(/^\d+\.\s*([^\s-]+)/i);
             if (!serverMatch) continue;
             var serverName = serverMatch[1].toLowerCase();
-            if (serverName !== 'streamwish') continue; // Solo Streamwish
+            if (serverName !== 'streamwish') continue;
             var qualMatch = text.match(/-\s*(\S+)\s*$/i);
             var quality = qualMatch ? qualMatch[1] : 'HD';
             results.push({ playerUrl: playerUrl, label: 'Streamwish · ' + lang + ' · ' + quality });
@@ -315,7 +316,7 @@ async function searchPoseidon2hd(q) {
         var tMatch = block.match(/<span[^>]+class="[^"]*Title[^"]*block[^"]*"[^>]*>([^<]+)<\/span>/i);
         if (!tMatch) tMatch = block.match(/<span[^>]+class="[^"]*block[^"]*Title[^"]*"[^>]*>([^<]+)<\/span>/i);
         if (!tMatch) continue;
-        var title = tMatch[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+        var title = tMatch[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;\b/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
         if (!title) continue;
 
         results.push({ title: title, url: url });
@@ -381,7 +382,7 @@ async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode) {
 }
 
 // ==========================================
-// INTEGRACIÓN CON STREMIO ADDON SDK
+// INTEGRACIÓN CON STREMIO ADDON SDK (EXPRESS)
 // ==========================================
 const manifest = {
     id: "org.poseidonhd2.stremio",
@@ -397,71 +398,102 @@ const manifest = {
 const builder = new addonBuilder(manifest);
 
 builder.defineStreamHandler(async (args) => {
-    const [imdbId, season, episode] = args.id.split(':');
-    
-    let titleToSearch = '';
     try {
-        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${args.type}/${imdbId}.json`);
-        if (metaRes.data && metaRes.data.meta) {
-            titleToSearch = metaRes.data.meta.name;
-        }
-    } catch (e) {
-        console.log("No se pudo obtener meta de cinemeta para", imdbId);
-        return { streams: [] };
-    }
-
-    if (!titleToSearch) return { streams: [] };
-
-    const searchResults = await searchPoseidon2hd(titleToSearch);
-    if (!searchResults || searchResults.length === 0) return { streams: [] };
-    
-    const target = searchResults[0]; 
-    let poseidonData = null;
-
-    if (args.type === 'movie') {
-        poseidonData = await fetchPoseidonHD2Streams(target.url);
-    } else if (args.type === 'series') {
-        const seriesData = await fetchPoseidonHD2Series(target.url);
-        if (seriesData && seriesData.tmdbId && seriesData.slug) {
-            poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode);
-        }
-    }
-
-    if (!poseidonData || !poseidonData.streams) return { streams: [] };
-
-    const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
-        let cleanLabel = s.label.replace(' (DL)', '');
+        const [imdbId, season, episode] = args.id.split(':');
         
-        // Omitir VidHide para evitar bloqueos
-        if (s.label.toLowerCase().includes('vidhide')) {
-            return null;
+        let titleToSearch = '';
+        try {
+            const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${args.type}/${imdbId}.json`, { timeout: 5000 });
+            if (metaRes.data && metaRes.data.meta) {
+                titleToSearch = metaRes.data.meta.name;
+            }
+        } catch (e) {
+            return { streams: [] };
         }
 
-        const embedUrl = await resolveEmbedUrl(s.playerUrl);
-        if (embedUrl) {
-            const directData = await resolveDirectVideoUrl(embedUrl);
-            
-            if (directData && directData.url) {
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel,
-                    url: directData.url,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: directData.headers
-                        }
-                    }
-                };
+        if (!titleToSearch) return { streams: [] };
+
+        const searchResults = await searchPoseidon2hd(titleToSearch);
+        if (!searchResults || searchResults.length === 0) return { streams: [] };
+        
+        const target = searchResults[0]; 
+        let poseidonData = null;
+
+        if (args.type === 'movie') {
+            poseidonData = await fetchPoseidonHD2Streams(target.url);
+        } else if (args.type === 'series') {
+            const seriesData = await fetchPoseidonHD2Series(target.url);
+            if (seriesData && seriesData.tmdbId && seriesData.slug) {
+                poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode);
             }
         }
 
-        return null;
-    }));
+        if (!poseidonData || !poseidonData.streams) return { streams: [] };
 
-    return { streams: stremioStreams.filter(stream => stream !== null) };
+        const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
+            try {
+                let cleanLabel = s.label.replace(' (DL)', '');
+                
+                if (s.label.toLowerCase().includes('vidhide')) {
+                    return null;
+                }
+
+                const embedUrl = await resolveEmbedUrl(s.playerUrl);
+                if (embedUrl) {
+                    const directData = await resolveDirectVideoUrl(embedUrl);
+                    
+                    if (directData && directData.url) {
+                        return {
+                            name: "PoseidonHD",
+                            description: cleanLabel,
+                            url: directData.url,
+                            behaviorHints: {
+                                notWebReady: true,
+                                proxyHeaders: {
+                                    request: directData.headers
+                                }
+                            }
+                        };
+                    }
+                }
+            } catch (err) {}
+            return null;
+        }));
+
+        return { streams: stremioStreams.filter(stream => stream !== null) };
+    } catch (err) {
+        return { streams: [] };
+    }
+});
+
+const app = express();
+const addonInterface = builder.getInterface();
+
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    next();
+});
+
+app.get('/manifest.json', (req, res) => {
+    res.json(addonInterface.manifest);
+});
+
+app.get('/:resource/:type/:id/:extra?.json', async (req, res) => {
+    const { resource, type, id, extra } = req.params;
+    if (resource === 'stream') {
+        try {
+            const result = await addonInterface.handler(resource, type, id, extra);
+            res.json(result);
+        } catch (e) {
+            res.json({ streams: [] });
+        }
+    } else {
+        res.status(404).json({ err: 'Not found' });
+    }
 });
 
 const port = process.env.PORT || 7000;
-serveHTTP(builder.getInterface(), { port: port });
-console.log(`Addon de Stremio escuchando en puerto ${port}`);
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Addon de Stremio escuchando en puerto ${port}`);
+});
