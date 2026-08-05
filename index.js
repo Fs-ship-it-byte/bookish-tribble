@@ -91,7 +91,6 @@ function extractHlsFromCallistanise(code, base) {
     return null;
 }
 
-// Añadidos más dominios mutantes de Streamwish
 const EMBED_HOSTS = [
     'streamwish', 'niramirus', 'filemoon', 'embedwish', 'vidhide',
     'vidhideplus', 'wishfast', 'strwish', 'awish', 'flaswish',
@@ -100,10 +99,6 @@ const EMBED_HOSTS = [
     'vidmoly', 'vudeo', 'mp4upload', 'vtube.to', 'upstream',
     'hgplaycdn', 'medixiru'
 ];
-
-function patchDtoE(url) {
-    return url.replace(/\/d\/([A-Za-z0-9]+)(\?|$|#)/, '/e/$1$2').replace(/\/d\/([A-Za-z0-9]+)$/, '/e/$1');
-}
 
 function isEmbedHost(url) {
     for (var i = 0; i < EMBED_HOSTS.length; i++) {
@@ -145,11 +140,10 @@ function parseCliLiStreams(html) {
             var serverMatch = text.match(/^\d+\.\s*([^\s-]+)/i);
             if (!serverMatch) continue;
             var serverName = serverMatch[1].toLowerCase();
-            if (serverName !== 'vidhide' && serverName !== 'vidhideplus') continue;
+            if (serverName !== 'streamwish') continue; // Solo Streamwish
             var qualMatch = text.match(/-\s*(\S+)\s*$/i);
             var quality = qualMatch ? qualMatch[1] : 'HD';
-            var displayName = serverName === 'vidhideplus' ? 'VidHidePlus' : 'VidHide';
-            results.push({ playerUrl: playerUrl, label: displayName + ' · ' + lang + ' · ' + quality });
+            results.push({ playerUrl: playerUrl, label: 'Streamwish · ' + lang + ' · ' + quality });
         }
     }
     return results;
@@ -210,96 +204,20 @@ function parseNextData(html) {
     } catch(e) { return null; }
 }
 
-
 // ==========================================
 // FUNCIONES ASÍNCRONAS (SCRAPERS)
 // ==========================================
-async function resolveVidHideHls(url) {
-    var fileId = null;
-    var originDomain = 'https://vidhidepro.com';
-
-    var dm = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)/i);
-    if (dm) originDomain = dm[0];
-
-    var dmId = url.match(/https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+)\/(?:v|e)\/([A-Za-z0-9]+)/i);
-    if (dmId) {
-        fileId = dmId[1];
-    } else if (url.indexOf('player.poseidonhd2') !== -1 || url.indexOf('player.php') !== -1) {
-        var playerHtml;
-        try {
-            playerHtml = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
-        } catch(e) { return null; }
-        
-        var m = playerHtml.match(/['"](https?:\/\/(?:filelions\.[a-z]+|vidhide\w*\.[a-z]+))\/(?:v|e)\/([A-Za-z0-9]+)['"]/i);
-        if (!m) return null;
-        originDomain = m[1];
-        fileId = m[2];
-    } else {
-        return null;
-    }
-
-    var base = 'https://callistanise.com';
-    var calliPaths = ['/embed/', '/v/'];
-    for (var pi = 0; pi < calliPaths.length; pi++) {
-        var calliUrl = base + calliPaths[pi] + fileId;
-        var calliHtml;
-        try {
-            calliHtml = (await axios.get(calliUrl, {
-                headers: { 'User-Agent': PS_UA['User-Agent'], 'Referer': originDomain + '/' },
-                timeout: 8000
-            })).data;
-        } catch(e) { continue; }
-        
-        var hls = null;
-        
-        try {
-            var em = calliHtml.match(/\}\s*\(\s*['"]([\s\S]+?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]+?)['"]\s*\.split\(/im);
-            if (em && em[1] && em[4]) {
-                var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
-                hls = extractHlsFromCallistanise(decoded, base);
-            }
-        } catch(ex) {}
-
-        if (!hls) {
-            hls = extractHlsFromCallistanise(calliHtml, base);
-        }
-
-        if (hls) {
-            var finalHls = makeAbsoluteVh(hls, base);
-            
-            // Cabeceras dinámicas según el destino del stream
-            var headers = { "User-Agent": PS_UA['User-Agent'] };
-            if (finalHls.includes('callistanise.com')) {
-                headers["Referer"] = originDomain + '/';
-                headers["Origin"] = originDomain;
-            } else {
-                headers["Referer"] = 'https://callistanise.com/';
-                headers["Origin"] = 'https://callistanise.com';
-            }
-
-            return {
-                url: finalHls,
-                headers: headers
-            };
-        }
-    }
-    return null;
-}
-
-// --- COMIENZA EL CÓDIGO MODIFICADO ---
-
 async function resolveEmbedUrl(poseidonUrl) {
     var html;
     try {
         html = (await axios.get(poseidonUrl, { headers: PS_UA, timeout: 8000 })).data;
     } catch(e) { return null; }
 
-    // Regex agresivo: busca cualquier estructura "/e/ID" o "/embed/ID" sin importar el dominio
     var patterns = [
         /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
         /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
         /<meta[^>]+http-equiv\s*=\s*['"]refresh['""][^>]+content\s*=\s*['"][^'">\\s]+url=([^'">\\s]+)/i,
-        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]​/i,
+        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]/i,
         /(https?:\/\/[^\s'"<>\\]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^\s'"<>\\]*)/i
     ];
 
@@ -310,7 +228,6 @@ async function resolveEmbedUrl(poseidonUrl) {
     return null;
 }
 
-// ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
 async function resolveDirectVideoUrl(embedUrl) {
     try {
         const res = await axios.get(embedUrl, { 
@@ -327,7 +244,7 @@ async function resolveDirectVideoUrl(embedUrl) {
 
         let unpackedHtml = html;
         
-        const evalRegex = /\}\(\s*['"]([\s\S]*?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]*?)['"]\s*\.split\(['"]([^'"]+)['"]\)/g;
+        const evalRegex = /\}\(\s*['"]([\s\S]+?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]+?)['"]\s*\.split\(['"]([^'"]+)['"]\)/g;
         let match;
         
         while ((match = evalRegex.exec(html)) !== null) {
@@ -376,7 +293,6 @@ async function resolveDirectVideoUrl(embedUrl) {
     }
     return null;
 }
-// --- TERMINA EL CÓDIGO MODIFICADO ---
 
 async function searchPoseidon2hd(q) {
     var html;
@@ -430,9 +346,8 @@ async function fetchPoseidonHD2Streams(url) {
         for (var ei = 0; ei < entries.length; ei++) {
             var e = entries[ei];
             if (!e.result) continue;
-            if (e.cyberlocker === 'streamwish' || e.cyberlocker === 'vidhide') {
-                var serverName = e.cyberlocker === 'streamwish' ? 'Streamwish' : 'VidHide';
-                streams.push({ playerUrl: e.result, label: `${serverName} · ${langMap[lang]} · ${e.quality || 'HD'}` });
+            if (e.cyberlocker === 'streamwish') {
+                streams.push({ playerUrl: e.result, label: `Streamwish · ${langMap[lang]} · ${e.quality || 'HD'}` });
             }
         }
     }
@@ -464,7 +379,6 @@ async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode) {
     var url = `https://www.poseidonhd2.co/serie/${tmdbId}/${slug}/temporada/${season}/episodio/${episode}`;
     return await fetchPoseidonHD2Streams(url);
 }
-
 
 // ==========================================
 // INTEGRACIÓN CON STREMIO ADDON SDK
@@ -515,15 +429,14 @@ builder.defineStreamHandler(async (args) => {
 
     if (!poseidonData || !poseidonData.streams) return { streams: [] };
 
-   const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
+    const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
         let cleanLabel = s.label.replace(' (DL)', '');
         
-        // 1. Omitir completamente VidHide para evitar errores de IP
+        // Omitir VidHide para evitar bloqueos
         if (s.label.toLowerCase().includes('vidhide')) {
             return null;
         }
 
-        // 2. Procesar únicamente Streamwish y otros embeds compatibles
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
             const directData = await resolveDirectVideoUrl(embedUrl);
@@ -547,6 +460,7 @@ builder.defineStreamHandler(async (args) => {
     }));
 
     return { streams: stremioStreams.filter(stream => stream !== null) };
+});
 
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: port });
