@@ -1,0 +1,13 @@
+{
+  "name": "poseidonhd2-stremio",
+  "version": "1.0.0",
+  "description": "Addon de PoseidonHD2 para Stremio",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "stremio-addon-sdk": "latest"
+  }
+}
