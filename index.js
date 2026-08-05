@@ -313,7 +313,6 @@ async function resolveEmbedUrl(poseidonUrl) {
 // ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
 async function resolveDirectVideoUrl(embedUrl) {
     try {
-        // Obtenemos la página final (siguiendo redirecciones a niramirus u otros)
         const res = await axios.get(embedUrl, { 
             headers: { 
                 'User-Agent': PS_UA['User-Agent'], 
@@ -328,15 +327,14 @@ async function resolveDirectVideoUrl(embedUrl) {
 
         let unpackedHtml = html;
         
-        // 1. Desofuscador flexible: No importa si usa comillas simples o dobles
-        const evalRegex = /\}\(\s*['"]([\s\S]*?)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"]([\s\S]*?)['"]\s*\.split\(['"]([^'"]+)['"]\)/g;
+        const evalRegex = /\}\(\s*['"]([\s\S]*?)['"]\s*,\s*(\d+),\s*(\d+),\s*['"]([\s\S]*?)['"]\s*\.split\(['"]([^'"]+)['"]\)/g;
         let match;
         
         while ((match = evalRegex.exec(html)) !== null) {
             let p = match[1];
             let a = parseInt(match[2], 10);
             let c = parseInt(match[3], 10);
-            let k = match[4].split(match[5]); // match[5] captura el caracter de split (usualmente '|')
+            let k = match[4].split(match[5]);
             let e = function(c) { 
                 return (c < a ? '' : e(Math.floor(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36)); 
             };
@@ -346,18 +344,13 @@ async function resolveDirectVideoUrl(embedUrl) {
             unpackedHtml += "\n" + p;
         }
 
-        // 2. Limpiar barras invertidas que rompen las URLs (ej: https:\/\/ -> https://)
         unpackedHtml = unpackedHtml.replace(/\\/g, '');
 
-        // 3. Extracción masiva de URLs
         let urls = [];
-        
-        // Buscar URLs normales
         let urlRegex = /(https?:\/\/[^"'\s<>\{\}]+)/ig;
         let matches = unpackedHtml.match(urlRegex);
         if (matches) urls.push(...matches);
         
-        // Buscar URLs codificadas (ej: https%3A%2F%2F...)
         let encodedRegex = /(https?%3A%2F%2F[^"'\s<>\{\}]+)/ig;
         let encodedMatches = unpackedHtml.match(encodedRegex);
         if (encodedMatches) {
@@ -366,13 +359,16 @@ async function resolveDirectVideoUrl(embedUrl) {
             }));
         }
         
-        // 4. Filtrar la lista y quedarnos con el archivo de video (.m3u8 o .mp4)
         let videoUrl = urls.find(u => u.includes('.m3u8') || u.includes('.mp4'));
         
         if (videoUrl) {
             return {
                 url: videoUrl,
-                headers: { "Referer": origin + '/', "Origin": origin, "User-Agent": PS_UA['User-Agent'] }
+                headers: { 
+                    "Referer": origin + '/', 
+                    "Origin": origin, 
+                    "User-Agent": PS_UA['User-Agent'] 
+                }
             };
         }
     } catch (err) {
@@ -519,30 +515,15 @@ builder.defineStreamHandler(async (args) => {
 
     if (!poseidonData || !poseidonData.streams) return { streams: [] };
 
-    const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
-        let directUrl = null;
+   const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
         let cleanLabel = s.label.replace(' (DL)', '');
         
-       // 1. Resolver VidHide
+        // 1. Omitir completamente VidHide para evitar errores de IP
         if (s.label.toLowerCase().includes('vidhide')) {
-            const vidhideData = await resolveVidHideHls(s.playerUrl);
-            
-            if (vidhideData && vidhideData.url) {
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel + "\n(Directo)",
-                    url: vidhideData.url,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: vidhideData.headers
-                        }
-                    }
-                };
-            }
+            return null;
         }
 
-        // 2. Resolver Embeds (Streamwish, Medixiru, etc) inyectando cabeceras de proxy
+        // 2. Procesar únicamente Streamwish y otros embeds compatibles
         const embedUrl = await resolveEmbedUrl(s.playerUrl);
         if (embedUrl) {
             const directData = await resolveDirectVideoUrl(embedUrl);
@@ -550,7 +531,7 @@ builder.defineStreamHandler(async (args) => {
             if (directData && directData.url) {
                 return {
                     name: "PoseidonHD",
-                    description: cleanLabel + "\n(Directo)",
+                    description: cleanLabel,
                     url: directData.url,
                     behaviorHints: {
                         notWebReady: true,
@@ -560,13 +541,6 @@ builder.defineStreamHandler(async (args) => {
                     }
                 };
             }
-            
-            // Backup por si falla la extracción
-            return {
-                name: "PoseidonHD",
-                description: cleanLabel + "\n(External Web)",
-                externalUrl: embedUrl
-            };
         }
 
         return null;
