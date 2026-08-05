@@ -282,9 +282,9 @@ async function resolveEmbedUrl(poseidonUrl) {
 // ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
 async function resolveDirectVideoUrl(embedUrl) {
     try {
-        // Obtenemos la página final (siguiendo redirecciones)
+        // Obtenemos la página final (siguiendo redirecciones a niramirus u otros)
         const res = await axios.get(embedUrl, { 
-            headers: { ...PS_UA, 'Referer': 'https://www.google.com/' }, 
+            headers: { ...PS_UA, 'Referer': 'https://www.poseidonhd2.co/' }, 
             timeout: 10000 
         });
         
@@ -307,13 +307,17 @@ async function resolveDirectVideoUrl(embedUrl) {
             unpackedHtml += "\n" + p;
         }
 
-        // Buscar enlaces m3u8 o mp4
-        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\\s]+\.(?:m3u8|mp4)[^"'\\s]*)['"]/i;
+        // 1. Limpiamos las barras invertidas que rompen la extracción (https:\/\/ -> https://)
+        unpackedHtml = unpackedHtml.replace(/\\/g, '');
+
+        // 2. Búsqueda agresiva: Atrapa cualquier enlace http/https que contenga .m3u8 o .mp4
+        const fileRegex = /["'](https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)["']/i;
         const linkMatch = unpackedHtml.match(fileRegex);
         
         if (linkMatch) {
             return {
                 url: linkMatch[1],
+                // El origen dinámico (ej. niramirus.com) se pasa a Stremio para que apruebe la reproducción
                 headers: { "Referer": origin + '/', "Origin": origin, "User-Agent": PS_UA['User-Agent'] }
             };
         }
@@ -322,7 +326,6 @@ async function resolveDirectVideoUrl(embedUrl) {
     }
     return null;
 }
-
 // --- TERMINA EL CÓDIGO MODIFICADO ---
 
 async function searchPoseidon2hd(q) {
