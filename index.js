@@ -145,27 +145,55 @@ function isM3u8Url(u) {
 
 // Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
 // a apuntar a nuestro propio proxy, conservando los headers originales.
+//
+// IMPORTANTE: no decidimos "sub-playlist vs segmento" por la EXTENSIÓN del
+// archivo (algunos sitios, como este, nombran sus sub-playlists con ".txt" en
+// vez de ".m3u8"), sino por la ETIQUETA que las precede en el propio m3u8:
+// #EXT-X-STREAM-INF siempre indica que la línea siguiente es una sub-playlist,
+// sin importar cómo se llame el archivo.
 function rewriteM3u8(playlistText, baseUrl, headers) {
     const lines = playlistText.split(/\r?\n/);
+    let nextIsPlaylist = false;
+
     const out = lines.map((line) => {
         const trimmed = line.trim();
         if (!trimmed) return line;
 
-        // Reescribir atributos URI="..." (ej: #EXT-X-KEY, #EXT-X-MAP)
         if (trimmed.startsWith('#')) {
-            return line.replace(/URI="([^"]+)"/i, (m, uri) => {
+            const upper = trimmed.toUpperCase();
+
+            // #EXT-X-I-FRAME-STREAM-INF trae su URI en la misma línea y SIEMPRE
+            // apunta a otra sub-playlist (no a un segmento binario).
+            if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
+                return line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                    const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                    const token = encodeProxyToken(abs, headers);
+                    return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
+                });
+            }
+
+            // #EXT-X-KEY / #EXT-X-MAP: su URI sí es un recurso binario (clave de
+            // cifrado / segmento de inicialización), va por el proxy de segmentos.
+            const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
                 return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
             });
+
+            // Si esta etiqueta es #EXT-X-STREAM-INF, la línea SIGUIENTE (sin #)
+            // va a ser una sub-playlist, aunque su nombre de archivo no diga m3u8.
+            nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
+            return rewritten;
         }
 
-        // Línea de URI de segmento o sub-playlist
+        // Línea de URI real (segmento o sub-playlist)
         const absUrl = /^https?:\/\//i.test(trimmed)
             ? trimmed
             : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
         const token = encodeProxyToken(absUrl, headers);
-        return isM3u8Url(absUrl)
+        const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
+        nextIsPlaylist = false;
+        return isPlaylist
             ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
             : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
     });
