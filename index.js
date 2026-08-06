@@ -1132,6 +1132,57 @@ app.get('/debug/series', async (req, res) => {
 // Test de red simple y directo (sin navegador) para ver si el origen responde
 // bien a nuestro proxy y qué contenido/status trae realmente.
 // Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
+// Sigue TODA la cadena de una sola vez: master -> primera sub-playlist -> primer
+// segmento, cada uno pedido directo a nuestro propio /hlsproxy (no al origen),
+// tal como lo haría un reproductor real, para ver en qué eslabón se rompe.
+// Uso: /debug/fullchain?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
+app.get('/debug/fullchain', async (req, res) => {
+    const masterUrl = req.query.url;
+    if (!masterUrl) return res.status(400).send('Falta ?url=');
+    res.set('Content-Type', 'text/plain');
+    const log = [];
+    const t0 = Date.now();
+    const p = (msg) => log.push('[' + (Date.now() - t0) + 'ms] ' + msg);
+
+    async function fetchText(u) {
+        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
+    }
+    async function fetchBinary(u) {
+        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
+    }
+
+    try {
+        const masterResp = await fetchText(masterUrl);
+        p('MASTER status ' + masterResp.status + ', largo ' + String(masterResp.data).length);
+        if (masterResp.status !== 200) {
+            return res.send(log.join('\n') + '\n\nBody del master:\n' + String(masterResp.data).slice(0, 500));
+        }
+
+        const subLine = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!subLine) return res.send(log.join('\n') + '\n\nEl master no tiene ninguna línea de sub-playlist.');
+        p('Sub-playlist encontrada: ' + subLine.trim());
+
+        const subResp = await fetchText(subLine.trim());
+        p('SUB-PLAYLIST status ' + subResp.status + ', largo ' + String(subResp.data).length);
+        if (subResp.status !== 200) {
+            return res.send(log.join('\n') + '\n\nBody de la sub-playlist:\n' + String(subResp.data).slice(0, 500));
+        }
+        p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
+
+        const segLine = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!segLine) return res.send(log.join('\n') + '\n\nLa sub-playlist no tiene ningún segmento.');
+        p('Primer segmento encontrado: ' + segLine.trim());
+
+        const segResp = await fetchBinary(segLine.trim());
+        p('SEGMENTO status ' + segResp.status + ', bytes recibidos: ' + (segResp.data ? segResp.data.byteLength : 0));
+
+        res.send(log.join('\n'));
+    } catch (e) {
+        p('EXCEPCIÓN: ' + e.message);
+        res.status(500).send(log.join('\n'));
+    }
+});
+
 app.get('/debug/nettest', async (req, res) => {
     const proxyUrl = req.query.url;
     if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
