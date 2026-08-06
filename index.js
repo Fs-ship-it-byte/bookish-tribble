@@ -153,50 +153,6 @@ function isM3u8Url(u) {
     return /\.m3u8(\?|#|$)/i.test(u);
 }
 
-// Hosts típicos de redes de publicidad que algunos sitios "empalman" como si
-// fueran segmentos de video reales dentro del propio m3u8 (ad-splicing crudo).
-// Si un segmento viene de uno de estos hosts, lo salteamos junto con su
-// #EXTINF, para no trabar la reproducción esperando un "video" que en
-// realidad es una imagen/creativo publicitario con su propia CDN y firma.
-const AD_HOST_PATTERNS = [/tiktokcdn\.com$/i, /doubleclick\.net$/i, /googlesyndication\.com$/i, /^ads?\./i, /-ad-|ad-site/i];
-
-function looksLikeAdUrl(u) {
-    try {
-        const host = new URL(u).host;
-        return AD_HOST_PATTERNS.some(rx => rx.test(host)) || /ad-site|\/ads?\//i.test(u);
-    } catch (e) { return false; }
-}
-
-// Algunos mirrors del mismo contenido devuelven un playlist "de relleno" hecho
-// 100% de segmentos publicitarios en vez del video real (visto en hgplaycdn.com
-// para un episodio que en otro mirror, creatorpresence.cyou, sí tenía los 162
-// segmentos reales). Antes de aceptar una resolución como buena, chequeamos que
-// la primera sub-playlist tenga AL MENOS un segmento que no sea publicidad.
-async function masterHasRealContent(masterUrl, headers) {
-    try {
-        const masterResp = await axios.get(masterUrl, { headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
-        if (masterResp.status !== 200) return false;
-        const lines = String(masterResp.data).split(/\r?\n/);
-        const subLine = lines.find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!subLine) return false;
-        const subAbs = /^https?:\/\//i.test(subLine.trim()) ? subLine.trim() : makeAbsoluteVh(subLine.trim(), masterUrl.replace(/\/[^/]*$/, ''));
-
-        const subResp = await axios.get(subAbs, { headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
-        if (subResp.status !== 200) return false;
-        const subLines = String(subResp.data).split(/\r?\n/);
-        for (let i = 0; i < subLines.length; i++) {
-            const t = subLines[i].trim();
-            if (t && !t.startsWith('#')) {
-                const segAbs = /^https?:\/\//i.test(t) ? t : makeAbsoluteVh(t, subAbs.replace(/\/[^/]*$/, ''));
-                if (!looksLikeAdUrl(segAbs)) return true; // encontramos al menos un segmento real
-            }
-        }
-        return false;
-    } catch (e) {
-        return false;
-    }
-}
-
 // Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
 // a apuntar a nuestro propio proxy, conservando los headers originales.
 //
@@ -208,12 +164,10 @@ async function masterHasRealContent(masterUrl, headers) {
 function rewriteM3u8(playlistText, baseUrl, headers) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
-    const out = [];
 
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
+    const out = lines.map((line) => {
         const trimmed = line.trim();
-        if (!trimmed) { out.push(line); continue; }
+        if (!trimmed) return line;
 
         if (trimmed.startsWith('#')) {
             const upper = trimmed.toUpperCase();
@@ -221,50 +175,38 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             // #EXT-X-I-FRAME-STREAM-INF trae su URI en la misma línea y SIEMPRE
             // apunta a otra sub-playlist (no a un segmento binario).
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
-                out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                return line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                     const token = encodeProxyToken(abs, headers);
                     return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
-                }));
-                continue;
+                });
             }
 
             // #EXT-X-KEY / #EXT-X-MAP: su URI sí es un recurso binario (clave de
             // cifrado / segmento de inicialización), va por el proxy de segmentos.
-            out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
+            const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
                 return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
-            }));
+            });
 
             // Si esta etiqueta es #EXT-X-STREAM-INF, la línea SIGUIENTE (sin #)
             // va a ser una sub-playlist, aunque su nombre de archivo no diga m3u8.
             nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
-            continue;
+            return rewritten;
         }
 
         // Línea de URI real (segmento o sub-playlist)
         const absUrl = /^https?:\/\//i.test(trimmed)
             ? trimmed
             : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
+        const token = encodeProxyToken(absUrl, headers);
         const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
         nextIsPlaylist = false;
-
-        // Si es un segmento (no sub-playlist) y viene de un host de publicidad,
-        // lo saltamos junto con el #EXTINF que ya empujamos arriba, para que el
-        // reproductor no se trabe esperando un "segmento" que en realidad falla.
-        if (!isPlaylist && looksLikeAdUrl(absUrl)) {
-            if (out.length > 0 && out[out.length - 1].trim().toUpperCase().startsWith('#EXTINF')) {
-                out.pop();
-            }
-            continue;
-        }
-
-        const token = encodeProxyToken(absUrl, headers);
-        out.push(isPlaylist
+        return isPlaylist
             ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
-            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
-    }
+            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+    });
     return out.join('\n');
 }
 
@@ -1019,18 +961,7 @@ builder.defineStreamHandler(async (args) => {
             // 2b. Intento con navegador headless: necesario cuando el salto de
             //     dominio (streamwish.to -> niramirus.com, etc) y la carga del
             //     m3u8 solo ocurren ejecutando el JS real del sitio.
-            //
-            // Algunos mirrors del mismo contenido devuelven puro relleno
-            // publicitario en vez del video real. Si eso pasa, reintentamos la
-            // resolución (nueva pasada por el navegador) para ver si esta vez
-            // toca un mirror bueno, antes de rendirnos.
-            let swDataBrowser = null;
-            for (let attempt = 0; attempt < 3; attempt++) {
-                const candidate = await resolveStreamwishHlsViaBrowser(embedUrl);
-                if (!candidate || !candidate.url) continue;
-                const hasContent = await masterHasRealContent(candidate.url, candidate.headers);
-                if (hasContent) { swDataBrowser = candidate; break; }
-            }
+            const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
             if (swDataBrowser && swDataBrowser.url) {
                 // IMPORTANTE: no le pasamos la URL cruda de hgplaycdn al reproductor.
                 // El token del m3u8 quedó atado a la IP/headers con los que
@@ -1097,29 +1028,7 @@ app.get('/debug/streamwish', async (req, res) => {
     res.set('Content-Type', 'text/plain');
 
     const trace = [];
-    const t0 = Date.now();
     const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
-    trace.push('[' + (Date.now() - t0) + 'ms] Resolución terminada');
-
-    if (result && result.url) {
-        // Pedimos el m3u8 INMEDIATAMENTE después de resolverlo, sin ninguna
-        // demora humana de por medio, para descartar que el fallo sea por
-        // vencimiento del token en vez de un bug real.
-        try {
-            const upstream = await axios.get(result.url, {
-                headers: result.headers,
-                timeout: 12000,
-                responseType: 'text',
-                transformResponse: [(d) => d],
-                validateStatus: () => true
-            });
-            trace.push('[' + (Date.now() - t0) + 'ms] Fetch inmediato del m3u8: status ' + upstream.status);
-            trace.push('Primeros 300 chars: ' + String(upstream.data).slice(0, 300));
-        } catch (e) {
-            trace.push('[' + (Date.now() - t0) + 'ms] Fetch inmediato del m3u8 FALLÓ: ' + e.message);
-        }
-    }
-
     res.send(trace.join('\n') + '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)'));
 });
 
@@ -1201,57 +1110,6 @@ app.get('/debug/series', async (req, res) => {
 // Test de red simple y directo (sin navegador) para ver si el origen responde
 // bien a nuestro proxy y qué contenido/status trae realmente.
 // Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
-// Sigue TODA la cadena de una sola vez: master -> primera sub-playlist -> primer
-// segmento, cada uno pedido directo a nuestro propio /hlsproxy (no al origen),
-// tal como lo haría un reproductor real, para ver en qué eslabón se rompe.
-// Uso: /debug/fullchain?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
-app.get('/debug/fullchain', async (req, res) => {
-    const masterUrl = req.query.url;
-    if (!masterUrl) return res.status(400).send('Falta ?url=');
-    res.set('Content-Type', 'text/plain');
-    const log = [];
-    const t0 = Date.now();
-    const p = (msg) => log.push('[' + (Date.now() - t0) + 'ms] ' + msg);
-
-    async function fetchText(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
-    }
-    async function fetchBinary(u) {
-        return axios.get(u, { timeout: 12000, responseType: 'arraybuffer', validateStatus: () => true });
-    }
-
-    try {
-        const masterResp = await fetchText(masterUrl);
-        p('MASTER status ' + masterResp.status + ', largo ' + String(masterResp.data).length);
-        if (masterResp.status !== 200) {
-            return res.send(log.join('\n') + '\n\nBody del master:\n' + String(masterResp.data).slice(0, 500));
-        }
-
-        const subLine = String(masterResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!subLine) return res.send(log.join('\n') + '\n\nEl master no tiene ninguna línea de sub-playlist.');
-        p('Sub-playlist encontrada: ' + subLine.trim());
-
-        const subResp = await fetchText(subLine.trim());
-        p('SUB-PLAYLIST status ' + subResp.status + ', largo ' + String(subResp.data).length);
-        if (subResp.status !== 200) {
-            return res.send(log.join('\n') + '\n\nBody de la sub-playlist:\n' + String(subResp.data).slice(0, 500));
-        }
-        p('Primeros 300 chars de la sub-playlist:\n' + String(subResp.data).slice(0, 300));
-
-        const segLine = String(subResp.data).split(/\r?\n/).find(l => l.trim() && !l.trim().startsWith('#'));
-        if (!segLine) return res.send(log.join('\n') + '\n\nLa sub-playlist no tiene ningún segmento.');
-        p('Primer segmento encontrado: ' + segLine.trim());
-
-        const segResp = await fetchBinary(segLine.trim());
-        p('SEGMENTO status ' + segResp.status + ', bytes recibidos: ' + (segResp.data ? segResp.data.byteLength : 0));
-
-        res.send(log.join('\n'));
-    } catch (e) {
-        p('EXCEPCIÓN: ' + e.message);
-        res.status(500).send(log.join('\n'));
-    }
-});
-
 app.get('/debug/nettest', async (req, res) => {
     const proxyUrl = req.query.url;
     if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
