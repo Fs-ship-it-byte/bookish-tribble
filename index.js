@@ -645,19 +645,32 @@ async function searchPoseidon2hd(q) {
     return filterPsResults(results, q);
 }
 
-async function fetchPoseidonHD2Streams(url) {
+async function fetchPoseidonHD2Streams(url, trace) {
     var html;
     try {
         html = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
-    } catch(e) { return null; }
+        if (trace) trace.push('Fetch OK a ' + url + ' (largo HTML: ' + html.length + ')');
+    } catch(e) {
+        if (trace) trace.push('ERROR fetching ' + url + ': ' + (e.code || e.message) + (e.response ? (' status=' + e.response.status) : ''));
+        return null;
+    }
 
     var pp = parseNextData(html);
-    if (!pp) return null;
+    if (!pp) {
+        if (trace) trace.push('parseNextData no encontró __NEXT_DATA__ o no pudo parsear el JSON');
+        return null;
+    }
+    if (trace) trace.push('parseNextData OK, keys de pageProps: ' + Object.keys(pp).join(', '));
 
     var subject = pp.thisMovie || pp.thisEpisode || null;
-    if (!subject) return null;
+    if (!subject) {
+        if (trace) trace.push('Ni pp.thisMovie ni pp.thisEpisode existen en pageProps');
+        return null;
+    }
+    if (trace) trace.push('subject encontrado, keys: ' + Object.keys(subject).join(', '));
 
     var videos = subject.videos || {};
+    if (trace) trace.push('subject.videos: ' + JSON.stringify(videos).slice(0, 800));
     var streams = [];
     var langMap = { spanish: 'Español', latino: 'Latino', english: 'Subtitulado' };
     var langs = ['spanish', 'latino', 'english'];
@@ -675,7 +688,11 @@ async function fetchPoseidonHD2Streams(url) {
         }
     }
 
-    streams = streams.concat(parseDownloadTable(html)).concat(parseCliLiStreams(html));
+    var dlStreams = parseDownloadTable(html);
+    var cliStreams = parseCliLiStreams(html);
+    if (trace) trace.push('streams de videos[]: ' + streams.length + ', de tabla de descarga: ' + dlStreams.length + ', de cli: ' + cliStreams.length);
+
+    streams = streams.concat(dlStreams).concat(cliStreams);
     return { streams: streams };
 }
 
@@ -698,9 +715,9 @@ async function fetchPoseidonHD2Series(url) {
     };
 }
 
-async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode) {
+async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode, trace) {
     var url = `https://www.poseidonhd2.co/serie/${tmdbId}/${slug}/temporada/${season}/episodio/${episode}`;
-    return await fetchPoseidonHD2Streams(url);
+    return await fetchPoseidonHD2Streams(url, trace);
 }
 
 
@@ -927,7 +944,7 @@ app.get('/debug/series', async (req, res) => {
         const episodeUrl = `https://www.poseidonhd2.co/serie/${seriesData.tmdbId}/${seriesData.slug}/temporada/${season}/episodio/${episode}`;
         p('URL de episodio construida', episodeUrl);
 
-        const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode);
+        const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode, log);
         p('poseidonData.streams', poseidonData && poseidonData.streams);
 
         res.send(log.join('\n'));
