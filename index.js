@@ -303,6 +303,10 @@ function filterPsResults(results, query) {
         if (score >= 40) scored.push({ r: results[j], score: score });
     }
     scored.sort((a, b) => b.score - a.score);
+    // Si nuestro filtrado por palabras no encontró nada (típico cuando el título
+    // que buscamos está en un idioma distinto al indexado por el sitio), confiamos
+    // en el orden que ya nos dio el buscador de Poseidon en vez de devolver vacío.
+    if (scored.length === 0) return results;
     return scored.map(s => s.r);
 }
 
@@ -348,8 +352,8 @@ async function resolveVidHideHls(url) {
             })).data;
         } catch(e) { continue; }
         
-        var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\|'\)\s*\)/im);
-        if (em) {
+        var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\\|'\)\s*\)/im);
+        if (em && em[1] !== undefined && em[2] !== undefined && em[3] !== undefined && em[4] !== undefined) {
             var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
             var hls = extractHlsFromCallistanise(decoded, base);
             if (hls) return hls;
@@ -691,23 +695,44 @@ const builder = new addonBuilder(manifest);
 builder.defineStreamHandler(async (args) => {
     const [imdbId, season, episode] = args.id.split(':');
     
-    let titleToSearch = '';
+    // Cinemeta puede darnos varias variantes de título (nombre original en inglés,
+    // y a veces alternativos). Probamos varias para no depender de un solo idioma.
+    let titleCandidates = [];
     try {
         const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${args.type}/${imdbId}.json`);
-        if (metaRes.data && metaRes.data.meta) {
-            titleToSearch = metaRes.data.meta.name;
+        const meta = metaRes.data && metaRes.data.meta;
+        if (meta) {
+            if (meta.name) titleCandidates.push(meta.name);
+            // Cinemeta a veces incluye "slug" con el título formateado distinto, o
+            // "aka"/"akas" con nombres alternativos según la fuente (no siempre presente).
+            if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
+            if (meta.slug) {
+                const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
+                if (fromSlug) titleCandidates.push(fromSlug);
+            }
         }
     } catch (e) {
         console.log("No se pudo obtener meta de cinemeta para", imdbId);
         return { streams: [] };
     }
 
-    if (!titleToSearch) return { streams: [] };
+    titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+    if (titleCandidates.length === 0) return { streams: [] };
 
-    const searchResults = await searchPoseidon2hd(titleToSearch);
+    // Probamos cada variante de título hasta que el buscador de Poseidon encuentre algo.
+    let searchResults = [];
+    for (const candidate of titleCandidates) {
+        searchResults = await searchPoseidon2hd(candidate);
+        if (searchResults && searchResults.length > 0) break;
+    }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
-    
-    const target = searchResults[0]; 
+
+    // No tomamos ciegamente el primer resultado: nos quedamos con el que sea del
+    // tipo correcto (película vs serie), porque el buscador puede devolver ambos
+    // mezclados y el primero no siempre es del tipo que estamos pidiendo.
+    const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
+    const target = searchResults.find(r => r.url.indexOf(expectedPath) !== -1) || searchResults[0];
+
     let poseidonData = null;
 
     if (args.type === 'movie') {
