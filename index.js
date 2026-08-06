@@ -521,11 +521,13 @@ async function getBrowser() {
 // Resuelve el .m3u8 real abriendo el embed en un navegador headless,
 // siguiendo todos los saltos de dominio que haga el propio JS del sitio,
 // e interceptando la request de red hacia el .m3u8 cuando se dispare.
-async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
+async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
     timeoutMs = timeoutMs || 20000;
     let browser;
     let page;
     let onTargetCreated;
+    const t = (msg) => { if (trace) trace.push('[' + (Date.now() - tStart) + 'ms] ' + msg); };
+    const tStart = Date.now();
     try {
         browser = await getBrowser();
         page = await browser.newPage();
@@ -534,14 +536,13 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
 
         let resolved = null;
         let lastRefererByUrl = 'https://www.google.com/';
+        let requestCount = 0;
+        const seenHosts = new Set();
 
-        // Muchos de estos embeds (hglamioz, playnixes, etc) no cargan el video
-        // hasta que hay un clic real, y ese clic suele abrir una pestaña de
-        // publicidad como efecto secundario. La cerramos apenas aparece para
-        // que no estorbe, mientras la pestaña original sigue su curso normal.
         onTargetCreated = async (target) => {
             try {
                 if (target.opener() === page.target()) {
+                    t('Se abrió una pestaña nueva (popup/ad), cerrándola');
                     const popup = await target.page();
                     if (popup) await popup.close();
                 }
@@ -551,13 +552,14 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
 
         page.on('request', (req) => {
             const url = req.url();
-            // Cortamos imágenes/fuentes/media pesada innecesaria para acelerar la carga,
-            // pero dejamos pasar todo lo demás (incluyendo el propio .m3u8 y los scripts).
+            requestCount++;
+            try { seenHosts.add(new URL(url).host); } catch (e) {}
             const type = req.resourceType();
             if (type === 'image' || type === 'font' || type === 'media') {
                 req.abort();
                 return;
             }
+            if (/\.m3u8/i.test(url)) t('Request con ".m3u8" en la URL (resourceType=' + type + '): ' + url);
             if (!resolved && /\.m3u8(\?|$)/i.test(url)) {
                 resolved = {
                     url: url,
@@ -567,17 +569,29 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
                         'User-Agent': PS_UA['User-Agent']
                     }
                 };
+                t('¡MATCH! m3u8 capturado: ' + url);
             }
             req.continue();
+        });
+
+        page.on('console', (msg) => {
+            if (trace && /error|denied|blocked/i.test(msg.text())) t('console.' + msg.type() + ': ' + msg.text().slice(0, 200));
         });
 
         page.on('framenavigated', (frame) => {
             if (frame === page.mainFrame()) {
                 lastRefererByUrl = frame.url();
+                t('Navegó a: ' + frame.url());
             }
         });
 
-        await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
+        t('Iniciando goto a ' + embedUrl);
+        try {
+            await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
+            t('goto completó (domcontentloaded)');
+        } catch (e) {
+            t('goto tiró error/timeout: ' + e.message);
+        }
 
         const viewport = page.viewport() || { width: 1280, height: 720 };
         const centerX = Math.floor(viewport.width / 2);
@@ -585,26 +599,40 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
 
         const start = Date.now();
         let lastClickAt = 0;
+        let clickRound = 0;
         while (!resolved && Date.now() - start < timeoutMs) {
-            // Reintentamos el clic cada ~2s por si el primero solo cerró un overlay
-            // de publicidad y el player recién queda listo después del segundo/tercer clic.
             if (Date.now() - lastClickAt > 2000) {
                 lastClickAt = Date.now();
-                try { await page.mouse.click(centerX, centerY); } catch (e) { /* noop */ }
+                clickRound++;
                 try {
-                    // Intento adicional: si hay un <video> o un botón de play conocido,
-                    // clickearlo directamente en vez de solo el centro de la pantalla.
-                    await page.evaluate(() => {
+                    await page.mouse.click(centerX, centerY);
+                    t('Click #' + clickRound + ' en el centro (' + centerX + ',' + centerY + ')');
+                } catch (e) { t('Error al clickear centro: ' + e.message); }
+                try {
+                    const clickedSelector = await page.evaluate(() => {
                         const el = document.querySelector('video, .jw-icon-playback, .vjs-big-play-button, .play-button, #player, .plyr__control--overlaid');
-                        if (el) el.click();
+                        if (el) { el.click(); return el.tagName + (el.className ? '.' + el.className : ''); }
+                        return null;
                     });
+                    if (clickedSelector) t('Click directo sobre elemento: ' + clickedSelector);
                 } catch (e) { /* noop */ }
             }
             await new Promise(r => setTimeout(r, 300));
         }
 
+        t('Fin del loop. Requests totales vistos: ' + requestCount + '. Hosts: ' + [...seenHosts].join(', '));
+        if (!resolved) {
+            try {
+                const title = await page.title();
+                const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 300) : '');
+                t('Título de la página: ' + title);
+                t('Texto visible (primeros 300 chars): ' + bodyText);
+            } catch (e) { /* noop */ }
+        }
+
         return resolved;
     } catch (e) {
+        t('ERROR general: ' + e.message);
         return null;
     } finally {
         if (browser && onTargetCreated) {
@@ -915,6 +943,31 @@ app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
 
 // --- DIAGNÓSTICO TEMPORAL para series ---
 // Uso: /debug/series?imdb=tt0000000&season=1&episode=1
+// --- DIAGNÓSTICO TEMPORAL para embeds tipo streamwish ---
+// Uso: /debug/embed?url=<link de streamwish.to/e/xxxx o similar>
+app.get('/debug/embed', async (req, res) => {
+    const embedUrl = req.query.url;
+    if (!embedUrl) return res.status(400).send('Falta ?url=');
+
+    res.set('Content-Type', 'text/plain');
+    const trace = [];
+    const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+    res.send(trace.join('\n') + '\n\nRESULTADO FINAL: ' + JSON.stringify(result));
+});
+// --- FIN DIAGNÓSTICO TEMPORAL ---
+
+// --- DIAGNÓSTICO TEMPORAL para embeds de Streamwish/hglamioz/playnixes/etc ---
+// Uso: /debug/streamwish?url=<embed url completa, ej: https://hgplaycdn.com/e/xxxx>
+app.get('/debug/streamwish', async (req, res) => {
+    const embedUrl = req.query.url;
+    if (!embedUrl) return res.status(400).send('Falta ?url=<embed completa>');
+    res.set('Content-Type', 'text/plain');
+
+    const trace = [];
+    const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+    res.send(trace.join('\n') + '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)'));
+});
+
 app.get('/debug/series', async (req, res) => {
     const imdbId = req.query.imdb;
     const season = req.query.season || '1';
