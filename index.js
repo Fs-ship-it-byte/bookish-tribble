@@ -1028,7 +1028,29 @@ app.get('/debug/streamwish', async (req, res) => {
     res.set('Content-Type', 'text/plain');
 
     const trace = [];
+    const t0 = Date.now();
     const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+    trace.push('[' + (Date.now() - t0) + 'ms] Resolución terminada');
+
+    if (result && result.url) {
+        // Pedimos el m3u8 INMEDIATAMENTE después de resolverlo, sin ninguna
+        // demora humana de por medio, para descartar que el fallo sea por
+        // vencimiento del token en vez de un bug real.
+        try {
+            const upstream = await axios.get(result.url, {
+                headers: result.headers,
+                timeout: 12000,
+                responseType: 'text',
+                transformResponse: [(d) => d],
+                validateStatus: () => true
+            });
+            trace.push('[' + (Date.now() - t0) + 'ms] Fetch inmediato del m3u8: status ' + upstream.status);
+            trace.push('Primeros 300 chars: ' + String(upstream.data).slice(0, 300));
+        } catch (e) {
+            trace.push('[' + (Date.now() - t0) + 'ms] Fetch inmediato del m3u8 FALLÓ: ' + e.message);
+        }
+    }
+
     res.send(trace.join('\n') + '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)'));
 });
 
