@@ -824,6 +824,75 @@ const port = process.env.PORT || 7000;
 const app = express();
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
 app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
+
+// --- DIAGNÓSTICO TEMPORAL para series ---
+// Uso: /debug/series?imdb=tt0000000&season=1&episode=1
+app.get('/debug/series', async (req, res) => {
+    const imdbId = req.query.imdb;
+    const season = req.query.season || '1';
+    const episode = req.query.episode || '1';
+    if (!imdbId) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
+
+    res.set('Content-Type', 'text/plain');
+    const log = [];
+    const p = (label, val) => log.push(label + ': ' + (typeof val === 'object' ? JSON.stringify(val) : val));
+
+    try {
+        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
+        const meta = metaRes.data && metaRes.data.meta;
+        p('Meta name', meta && meta.name);
+        p('Meta slug', meta && meta.slug);
+        p('Meta aka', meta && meta.aka);
+
+        let titleCandidates = [];
+        if (meta) {
+            if (meta.name) titleCandidates.push(meta.name);
+            if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
+            if (meta.slug) {
+                const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
+                if (fromSlug) titleCandidates.push(fromSlug);
+            }
+        }
+        titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+        p('Candidatos de título', titleCandidates);
+
+        let searchResults = [];
+        let usedCandidate = null;
+        for (const candidate of titleCandidates) {
+            searchResults = await searchPoseidon2hd(candidate);
+            p('Búsqueda con "' + candidate + '" dio resultados', searchResults.map(r => r.title + ' -> ' + r.url));
+            if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
+        }
+
+        if (!searchResults || searchResults.length === 0) {
+            return res.send(log.join('\n') + '\n\nNO se encontró NADA en ninguna variante de título.');
+        }
+
+        const expectedPath = '/serie/';
+        const target = searchResults.find(r => r.url.indexOf(expectedPath) !== -1) || searchResults[0];
+        p('Target elegido', target.url);
+
+        const seriesData = await fetchPoseidonHD2Series(target.url);
+        p('seriesData (tmdbId/slug)', seriesData);
+
+        if (!seriesData || !seriesData.tmdbId || !seriesData.slug) {
+            return res.send(log.join('\n') + '\n\nfetchPoseidonHD2Series no devolvió tmdbId/slug válidos.');
+        }
+
+        const episodeUrl = `https://www.poseidonhd2.co/serie/${seriesData.tmdbId}/${seriesData.slug}/temporada/${season}/episodio/${episode}`;
+        p('URL de episodio construida', episodeUrl);
+
+        const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode);
+        p('poseidonData.streams', poseidonData && poseidonData.streams);
+
+        res.send(log.join('\n'));
+    } catch (e) {
+        p('ERROR', e.message);
+        res.status(500).send(log.join('\n'));
+    }
+});
+// --- FIN DIAGNÓSTICO TEMPORAL ---
+
 app.use(getRouter(builder.getInterface()));
 
 app.listen(port, () => {
