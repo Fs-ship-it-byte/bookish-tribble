@@ -167,6 +167,36 @@ function looksLikeAdUrl(u) {
     } catch (e) { return false; }
 }
 
+// Algunos mirrors del mismo contenido devuelven un playlist "de relleno" hecho
+// 100% de segmentos publicitarios en vez del video real (visto en hgplaycdn.com
+// para un episodio que en otro mirror, creatorpresence.cyou, sí tenía los 162
+// segmentos reales). Antes de aceptar una resolución como buena, chequeamos que
+// la primera sub-playlist tenga AL MENOS un segmento que no sea publicidad.
+async function masterHasRealContent(masterUrl, headers) {
+    try {
+        const masterResp = await axios.get(masterUrl, { headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
+        if (masterResp.status !== 200) return false;
+        const lines = String(masterResp.data).split(/\r?\n/);
+        const subLine = lines.find(l => l.trim() && !l.trim().startsWith('#'));
+        if (!subLine) return false;
+        const subAbs = /^https?:\/\//i.test(subLine.trim()) ? subLine.trim() : makeAbsoluteVh(subLine.trim(), masterUrl.replace(/\/[^/]*$/, ''));
+
+        const subResp = await axios.get(subAbs, { headers, timeout: 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true });
+        if (subResp.status !== 200) return false;
+        const subLines = String(subResp.data).split(/\r?\n/);
+        for (let i = 0; i < subLines.length; i++) {
+            const t = subLines[i].trim();
+            if (t && !t.startsWith('#')) {
+                const segAbs = /^https?:\/\//i.test(t) ? t : makeAbsoluteVh(t, subAbs.replace(/\/[^/]*$/, ''));
+                if (!looksLikeAdUrl(segAbs)) return true; // encontramos al menos un segmento real
+            }
+        }
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+
 // Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
 // a apuntar a nuestro propio proxy, conservando los headers originales.
 //
@@ -989,7 +1019,18 @@ builder.defineStreamHandler(async (args) => {
             // 2b. Intento con navegador headless: necesario cuando el salto de
             //     dominio (streamwish.to -> niramirus.com, etc) y la carga del
             //     m3u8 solo ocurren ejecutando el JS real del sitio.
-            const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
+            //
+            // Algunos mirrors del mismo contenido devuelven puro relleno
+            // publicitario en vez del video real. Si eso pasa, reintentamos la
+            // resolución (nueva pasada por el navegador) para ver si esta vez
+            // toca un mirror bueno, antes de rendirnos.
+            let swDataBrowser = null;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const candidate = await resolveStreamwishHlsViaBrowser(embedUrl);
+                if (!candidate || !candidate.url) continue;
+                const hasContent = await masterHasRealContent(candidate.url, candidate.headers);
+                if (hasContent) { swDataBrowser = candidate; break; }
+            }
             if (swDataBrowser && swDataBrowser.url) {
                 // IMPORTANTE: no le pasamos la URL cruda de hgplaycdn al reproductor.
                 // El token del m3u8 quedó atado a la IP/headers con los que
