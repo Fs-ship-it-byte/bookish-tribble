@@ -662,7 +662,7 @@ async function fetchPoseidonHD2Streams(url, trace) {
     }
     if (trace) trace.push('parseNextData OK, keys de pageProps: ' + Object.keys(pp).join(', '));
 
-    var subject = pp.thisMovie || pp.thisEpisode || null;
+    var subject = pp.thisMovie || pp.thisEpisode || pp.episode || null;
     if (!subject) {
         if (trace) trace.push('Ni pp.thisMovie ni pp.thisEpisode existen en pageProps');
         return null;
