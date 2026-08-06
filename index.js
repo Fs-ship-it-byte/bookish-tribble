@@ -153,6 +153,20 @@ function isM3u8Url(u) {
     return /\.m3u8(\?|#|$)/i.test(u);
 }
 
+// Hosts típicos de redes de publicidad que algunos sitios "empalman" como si
+// fueran segmentos de video reales dentro del propio m3u8 (ad-splicing crudo).
+// Si un segmento viene de uno de estos hosts, lo salteamos junto con su
+// #EXTINF, para no trabar la reproducción esperando un "video" que en
+// realidad es una imagen/creativo publicitario con su propia CDN y firma.
+const AD_HOST_PATTERNS = [/tiktokcdn\.com$/i, /doubleclick\.net$/i, /googlesyndication\.com$/i, /^ads?\./i, /-ad-|ad-site/i];
+
+function looksLikeAdUrl(u) {
+    try {
+        const host = new URL(u).host;
+        return AD_HOST_PATTERNS.some(rx => rx.test(host)) || /ad-site|\/ads?\//i.test(u);
+    } catch (e) { return false; }
+}
+
 // Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
 // a apuntar a nuestro propio proxy, conservando los headers originales.
 //
@@ -164,10 +178,12 @@ function isM3u8Url(u) {
 function rewriteM3u8(playlistText, baseUrl, headers) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
+    const out = [];
 
-    const out = lines.map((line) => {
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
         const trimmed = line.trim();
-        if (!trimmed) return line;
+        if (!trimmed) { out.push(line); continue; }
 
         if (trimmed.startsWith('#')) {
             const upper = trimmed.toUpperCase();
@@ -175,38 +191,50 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             // #EXT-X-I-FRAME-STREAM-INF trae su URI en la misma línea y SIEMPRE
             // apunta a otra sub-playlist (no a un segmento binario).
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
-                return line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                     const token = encodeProxyToken(abs, headers);
                     return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
-                });
+                }));
+                continue;
             }
 
             // #EXT-X-KEY / #EXT-X-MAP: su URI sí es un recurso binario (clave de
             // cifrado / segmento de inicialización), va por el proxy de segmentos.
-            const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
+            out.push(line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
                 return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
-            });
+            }));
 
             // Si esta etiqueta es #EXT-X-STREAM-INF, la línea SIGUIENTE (sin #)
             // va a ser una sub-playlist, aunque su nombre de archivo no diga m3u8.
             nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
-            return rewritten;
+            continue;
         }
 
         // Línea de URI real (segmento o sub-playlist)
         const absUrl = /^https?:\/\//i.test(trimmed)
             ? trimmed
             : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
-        const token = encodeProxyToken(absUrl, headers);
         const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
         nextIsPlaylist = false;
-        return isPlaylist
+
+        // Si es un segmento (no sub-playlist) y viene de un host de publicidad,
+        // lo saltamos junto con el #EXTINF que ya empujamos arriba, para que el
+        // reproductor no se trabe esperando un "segmento" que en realidad falla.
+        if (!isPlaylist && looksLikeAdUrl(absUrl)) {
+            if (out.length > 0 && out[out.length - 1].trim().toUpperCase().startsWith('#EXTINF')) {
+                out.pop();
+            }
+            continue;
+        }
+
+        const token = encodeProxyToken(absUrl, headers);
+        out.push(isPlaylist
             ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
-            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
-    });
+            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`);
+    }
     return out.join('\n');
 }
 
