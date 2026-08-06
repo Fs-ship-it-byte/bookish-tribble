@@ -564,6 +564,9 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
                 return;
             }
             if (/\.m3u8/i.test(url)) t('Request con ".m3u8" en la URL (resourceType=' + type + '): ' + url);
+            if (type === 'xhr' || type === 'fetch' || (type === 'media' && !/\.(png|jpg|jpeg|gif|webp|svg)(\?|$)/i.test(url))) {
+                t('[' + type + '] ' + url);
+            }
             if (!resolved && /\.m3u8(\?|$)/i.test(url)) {
                 resolved = {
                     url: url,
@@ -573,9 +576,28 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
                         'User-Agent': PS_UA['User-Agent']
                     }
                 };
-                t('¡MATCH! m3u8 capturado: ' + url);
+                t('¡MATCH! m3u8 capturado (por URL): ' + url);
             }
             req.continue();
+        });
+
+        page.on('response', async (resp) => {
+            if (resolved) return;
+            try {
+                const ct = resp.headers()['content-type'] || '';
+                const rUrl = resp.url();
+                if (/mpegurl|vnd\.apple\.mpegurl|dash\+xml/i.test(ct)) {
+                    resolved = {
+                        url: rUrl,
+                        headers: {
+                            'Referer': resp.request().headers()['referer'] || lastRefererByUrl,
+                            'Origin': new URL(rUrl).origin,
+                            'User-Agent': PS_UA['User-Agent']
+                        }
+                    };
+                    t('¡MATCH! Manifiesto detectado por content-type "' + ct + '": ' + rUrl);
+                }
+            } catch (e) { /* noop */ }
         });
 
         page.on('console', (msg) => {
