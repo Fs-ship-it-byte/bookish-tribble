@@ -522,9 +522,10 @@ async function getBrowser() {
 // siguiendo todos los saltos de dominio que haga el propio JS del sitio,
 // e interceptando la request de red hacia el .m3u8 cuando se dispare.
 async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
-    timeoutMs = timeoutMs || 15000;
+    timeoutMs = timeoutMs || 20000;
     let browser;
     let page;
+    let onTargetCreated;
     try {
         browser = await getBrowser();
         page = await browser.newPage();
@@ -533,6 +534,20 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
 
         let resolved = null;
         let lastRefererByUrl = 'https://www.google.com/';
+
+        // Muchos de estos embeds (hglamioz, playnixes, etc) no cargan el video
+        // hasta que hay un clic real, y ese clic suele abrir una pestaña de
+        // publicidad como efecto secundario. La cerramos apenas aparece para
+        // que no estorbe, mientras la pestaña original sigue su curso normal.
+        onTargetCreated = async (target) => {
+            try {
+                if (target.opener() === page.target()) {
+                    const popup = await target.page();
+                    if (popup) await popup.close();
+                }
+            } catch (e) { /* noop */ }
+        };
+        browser.on('targetcreated', onTargetCreated);
 
         page.on('request', (req) => {
             const url = req.url();
@@ -564,10 +579,27 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
 
         await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
 
-        // Le damos un margen para que el player dispare el fetch/XHR del m3u8
-        // luego de que el DOM y los scripts terminen de correr.
+        const viewport = page.viewport() || { width: 1280, height: 720 };
+        const centerX = Math.floor(viewport.width / 2);
+        const centerY = Math.floor(viewport.height / 2);
+
         const start = Date.now();
+        let lastClickAt = 0;
         while (!resolved && Date.now() - start < timeoutMs) {
+            // Reintentamos el clic cada ~2s por si el primero solo cerró un overlay
+            // de publicidad y el player recién queda listo después del segundo/tercer clic.
+            if (Date.now() - lastClickAt > 2000) {
+                lastClickAt = Date.now();
+                try { await page.mouse.click(centerX, centerY); } catch (e) { /* noop */ }
+                try {
+                    // Intento adicional: si hay un <video> o un botón de play conocido,
+                    // clickearlo directamente en vez de solo el centro de la pantalla.
+                    await page.evaluate(() => {
+                        const el = document.querySelector('video, .jw-icon-playback, .vjs-big-play-button, .play-button, #player, .plyr__control--overlaid');
+                        if (el) el.click();
+                    });
+                } catch (e) { /* noop */ }
+            }
             await new Promise(r => setTimeout(r, 300));
         }
 
@@ -575,6 +607,9 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs) {
     } catch (e) {
         return null;
     } finally {
+        if (browser && onTargetCreated) {
+            try { browser.off('targetcreated', onTargetCreated); } catch (e) {}
+        }
         if (page) {
             try { await page.close(); } catch (e) {}
         }
