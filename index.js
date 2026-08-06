@@ -555,7 +555,11 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
             requestCount++;
             try { seenHosts.add(new URL(url).host); } catch (e) {}
             const type = req.resourceType();
-            if (type === 'image' || type === 'font' || type === 'media') {
+            // OJO: NO abortamos 'media' — el propio <video> puede pedir el .m3u8
+            // o los segmentos directamente como resourceType 'media' (sin pasar
+            // por hls.js/XHR), y si lo abortamos nunca vemos esa URL ni el video
+            // llega a reproducir de verdad. Solo cortamos imágenes/fuentes.
+            if (type === 'image' || type === 'font') {
                 req.abort();
                 return;
             }
