@@ -24,7 +24,17 @@ function makeAbsoluteVh(url, base) {
     if (!url) return null;
     if (/^https?:\/\//i.test(url)) return url;
     if (url.indexOf('//') === 0) return 'https:' + url;
-    if (url.indexOf('/') === 0) return base + url;
+    if (url.indexOf('/') === 0) {
+        // Path absoluto desde la raíz del dominio (empieza con "/"): hay que
+        // resolverlo contra el ORIGEN (protocolo+host), no contra el directorio
+        // completo de "base" — si no, el path del directorio queda duplicado
+        // (ej: ".../carpeta/carpeta/archivo.ts" en vez de ".../carpeta/archivo.ts").
+        try {
+            return new URL(base).origin + url;
+        } catch (e) {
+            return base + url;
+        }
+    }
     return base + '/' + url;
 }
 
