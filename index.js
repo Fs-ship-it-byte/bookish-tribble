@@ -726,13 +726,13 @@ builder.defineStreamHandler(async (args) => {
     // Cinemeta puede darnos varias variantes de título (nombre original en inglés,
     // y a veces alternativos). Probamos varias para no depender de un solo idioma.
     let titleCandidates = [];
+    let tmdbIdFromMeta = null;
     try {
         const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${args.type}/${imdbId}.json`);
         const meta = metaRes.data && metaRes.data.meta;
         if (meta) {
+            if (meta.moviedb_id) tmdbIdFromMeta = String(meta.moviedb_id);
             if (meta.name) titleCandidates.push(meta.name);
-            // Cinemeta a veces incluye "slug" con el título formateado distinto, o
-            // "aka"/"akas" con nombres alternativos según la fuente (no siempre presente).
             if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
             if (meta.slug) {
                 const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
@@ -756,11 +756,17 @@ builder.defineStreamHandler(async (args) => {
     }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
 
-    // Entre los resultados del tipo correcto (película o serie), nos quedamos con
-    // el de mejor coincidencia real contra el título buscado, no el primero que
-    // aparezca en el orden del sitio.
+    // Entre los resultados del tipo correcto (película o serie), primero intentamos
+    // un match EXACTO por ID de TMDB (determinístico, no depende del idioma del
+    // título). Si no lo tenemos o no aparece, recién ahí caemos al puntaje por
+    // palabras como respaldo.
     const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
-    const target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+    let target = null;
+    if (tmdbIdFromMeta) {
+        const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
+        target = searchResults.find(r => idRegex.test(r.url)) || null;
+    }
+    if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
     if (!target) return { streams: [] };
 
     let poseidonData = null;
@@ -873,6 +879,8 @@ app.get('/debug/series', async (req, res) => {
         p('Meta name', meta && meta.name);
         p('Meta slug', meta && meta.slug);
         p('Meta aka', meta && meta.aka);
+        p('Meta moviedb_id (TMDB)', meta && meta.moviedb_id);
+        const tmdbIdFromMeta = meta && meta.moviedb_id ? String(meta.moviedb_id) : null;
 
         let titleCandidates = [];
         if (meta) {
@@ -899,7 +907,13 @@ app.get('/debug/series', async (req, res) => {
         }
 
         const expectedPath = '/serie/';
-        const target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+        let target = null;
+        if (tmdbIdFromMeta) {
+            const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
+            target = searchResults.find(r => idRegex.test(r.url)) || null;
+            p('Match exacto por TMDB ID (' + tmdbIdFromMeta + ')', target ? target.url : 'NO encontrado');
+        }
+        if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
         if (!target) return res.send(log.join('\n') + '\n\nNo se encontró ningún resultado.');
         p('Target elegido', target.url + ' (título: ' + target.title + ')');
 
