@@ -286,6 +286,34 @@ function scorePsResult(qWords, tn) {
     return Math.floor(matched * 80 / qWords.length);
 }
 
+// Elige, DENTRO de los resultados del tipo correcto (película o serie), el que
+// mejor puntaje de coincidencia tenga contra el título buscado — en vez de tomar
+// ciegamente el primero que aparezca en el orden que devolvió el sitio. Esto es
+// clave cuando el filtro global ya descartó todo por diferencia de idioma y
+// caímos al fallback de orden crudo, donde el primero de un tipo no siempre es
+// el correcto (ver caso "Dragon Goes House-Hunting" vs "La casa del dragón").
+function pickBestPsMatch(results, query, expectedPath) {
+    if (!results || results.length === 0) return null;
+    var qn = normPsTitle(query);
+    var qRaw = qn.split(' ');
+    var qWords = [];
+    for (var i = 0; i < qRaw.length; i++) {
+        if (qRaw[i].length > 2 && !PS_STOP[qRaw[i]]) qWords.push(qRaw[i]);
+    }
+
+    var candidates = expectedPath ? results.filter(r => r.url.indexOf(expectedPath) !== -1) : results;
+    if (candidates.length === 0) candidates = results;
+
+    var best = candidates[0];
+    var bestScore = -1;
+    for (var j = 0; j < candidates.length; j++) {
+        var tn = normPsTitle(candidates[j].title);
+        var score = (qn === tn) ? 100 : scorePsResult(qWords, tn);
+        if (score > bestScore) { bestScore = score; best = candidates[j]; }
+    }
+    return best;
+}
+
 function filterPsResults(results, query) {
     var qn = normPsTitle(query);
     var qRaw = qn.split(' ');
@@ -721,17 +749,19 @@ builder.defineStreamHandler(async (args) => {
 
     // Probamos cada variante de título hasta que el buscador de Poseidon encuentre algo.
     let searchResults = [];
+    let usedCandidate = null;
     for (const candidate of titleCandidates) {
         searchResults = await searchPoseidon2hd(candidate);
-        if (searchResults && searchResults.length > 0) break;
+        if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
     }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
 
-    // No tomamos ciegamente el primer resultado: nos quedamos con el que sea del
-    // tipo correcto (película vs serie), porque el buscador puede devolver ambos
-    // mezclados y el primero no siempre es del tipo que estamos pidiendo.
+    // Entre los resultados del tipo correcto (película o serie), nos quedamos con
+    // el de mejor coincidencia real contra el título buscado, no el primero que
+    // aparezca en el orden del sitio.
     const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
-    const target = searchResults.find(r => r.url.indexOf(expectedPath) !== -1) || searchResults[0];
+    const target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+    if (!target) return { streams: [] };
 
     let poseidonData = null;
 
@@ -869,8 +899,9 @@ app.get('/debug/series', async (req, res) => {
         }
 
         const expectedPath = '/serie/';
-        const target = searchResults.find(r => r.url.indexOf(expectedPath) !== -1) || searchResults[0];
-        p('Target elegido', target.url);
+        const target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+        if (!target) return res.send(log.join('\n') + '\n\nNo se encontró ningún resultado.');
+        p('Target elegido', target.url + ' (título: ' + target.title + ')');
 
         const seriesData = await fetchPoseidonHD2Series(target.url);
         p('seriesData (tmdbId/slug)', seriesData);
