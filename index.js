@@ -1069,6 +1069,46 @@ app.get('/debug/series', async (req, res) => {
 });
 // --- FIN DIAGNÓSTICO TEMPORAL ---
 
+// Test de red simple y directo (sin navegador) para ver si el origen responde
+// bien a nuestro proxy y qué contenido/status trae realmente.
+// Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
+app.get('/debug/nettest', async (req, res) => {
+    const proxyUrl = req.query.url;
+    if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
+
+    const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
+    if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
+
+    const data = decodeProxyToken(m[1]);
+    if (!data) return res.status(400).send('No se pudo decodificar el token');
+
+    res.set('Content-Type', 'text/plain');
+    const start = Date.now();
+    try {
+        const upstream = await axios.get(data.url, {
+            headers: data.headers,
+            timeout: 12000,
+            responseType: 'text',
+            transformResponse: [(d) => d],
+            validateStatus: () => true
+        });
+        res.send(
+            'URL: ' + data.url +
+            '\nTiempo: ' + (Date.now() - start) + 'ms' +
+            '\nStatus: ' + upstream.status +
+            '\nHeaders respuesta: ' + JSON.stringify(upstream.headers, null, 2) +
+            '\n\nPrimeros 800 caracteres del body:\n' + String(upstream.data).slice(0, 800)
+        );
+    } catch (e) {
+        res.send(
+            'URL: ' + data.url +
+            '\nTiempo hasta el error: ' + (Date.now() - start) + 'ms' +
+            '\nError code: ' + (e.code || 'N/A') +
+            '\nError message: ' + e.message
+        );
+    }
+});
+
 app.use(getRouter(builder.getInterface()));
 
 app.listen(port, () => {
