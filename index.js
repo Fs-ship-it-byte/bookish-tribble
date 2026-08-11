@@ -9,21 +9,23 @@ const axios = require('axios');
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 
 async function getTmdbId(imdbId, type) {
-    if (!TMDB_API_KEY) return null;
+    if (!TMDB_API_KEY) return { id: null, esTitle: null };
     try {
         const resp = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
-            params: { api_key: TMDB_API_KEY, external_source: 'imdb_id' },
+            params: { api_key: TMDB_API_KEY, external_source: 'imdb_id', language: 'es-MX' },
             timeout: 6000
         });
         const key = type === 'series' ? 'tv_results' : 'movie_results';
         const results = resp.data && resp.data[key];
         if (results && results.length > 0) {
-            return String(results[0].id);
+            const item = results[0];
+            const esTitle = item.title || item.name || null;
+            return { id: String(item.id), esTitle };
         }
-        return null;
+        return { id: null, esTitle: null };
     } catch (e) {
         console.log('Error consultando TMDB find:', e.message);
-        return null;
+        return { id: null, esTitle: null };
     }
 }
 const puppeteer = require('puppeteer');
@@ -918,20 +920,35 @@ builder.defineStreamHandler(async (args) => {
     // Lo pedimos directo a la API de TMDB primero (más confiable que
     // depender de que Cinemeta lo tenga cargado), y si eso falla, usamos el
     // que trajo Cinemeta como respaldo.
-    const tmdbId = await getTmdbId(imdbId, args.type) || tmdbIdFromMeta;
-    console.log(`imdbId=${imdbId} type=${args.type} tmdbId=${tmdbId}`);
+    const tmdbResult = await getTmdbId(imdbId, args.type);
+    const tmdbId = tmdbResult.id || tmdbIdFromMeta;
+    console.log(`imdbId=${imdbId} type=${args.type} tmdbId=${tmdbId} esTitle=${tmdbResult.esTitle}`);
 
     titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+    // Agregamos el título en español (es-MX) de TMDB como candidato -- el
+    // buscador de Poseidon es en español, así que buscar en inglés a veces
+    // no encuentra nada aunque el contenido sí esté en el sitio. Lo probamos
+    // primero, ya que es más probable que encuentre resultados relevantes.
+    if (tmdbResult.esTitle) titleCandidates = [tmdbResult.esTitle, ...titleCandidates.filter(t => t !== tmdbResult.esTitle)];
     if (titleCandidates.length === 0) return { streams: [] };
 
-    // Probamos cada variante de título hasta que el buscador de Poseidon encuentre algo.
+    console.log('Candidatos de título a probar:', JSON.stringify(titleCandidates));
+    // Juntamos los resultados de TODOS los candidatos (no solo el primero que
+    // traiga algo), porque el match final es por ID de TMDB exacto -- así que
+    // conviene tener el pool más grande posible de resultados donde buscar.
     let searchResults = [];
     let usedCandidate = null;
-    console.log('Candidatos de título a probar:', JSON.stringify(titleCandidates));
+    const seenUrls = new Set();
     for (const candidate of titleCandidates) {
-        searchResults = await searchPoseidon2hd(candidate);
-        console.log(`Búsqueda con "${candidate}" -> ${searchResults.length} resultado(s): ` + JSON.stringify(searchResults.map(r => r.url)));
-        if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
+        const results = await searchPoseidon2hd(candidate);
+        console.log(`Búsqueda con "${candidate}" -> ${results.length} resultado(s): ` + JSON.stringify(results.map(r => r.url)));
+        for (const r of results) {
+            if (!seenUrls.has(r.url)) {
+                seenUrls.add(r.url);
+                searchResults.push(r);
+            }
+        }
+        if (!usedCandidate && results.length > 0) usedCandidate = candidate;
     }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
 
