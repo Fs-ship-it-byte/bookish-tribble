@@ -905,7 +905,32 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// Stremio suele reintentar automáticamente si un pedido de stream tarda
+// mucho en responder -- eso dispara TODO el pipeline de nuevo (incluyendo
+// otro navegador Puppeteer), duplicando el trabajo y compitiendo por los
+// mismos recursos, lo cual paradójicamente hace que todo tarde AÚN MÁS
+// (un círculo vicioso). Para cortarlo: si llega un pedido idéntico
+// (mismo type+id) mientras ya hay uno igual en curso, esperamos el MISMO
+// resultado en vez de arrancar todo de nuevo desde cero.
+const inFlightRequests = new Map();
+
 builder.defineStreamHandler(async (args) => {
+    const requestKey = `${args.type}:${args.id}`;
+    if (inFlightRequests.has(requestKey)) {
+        console.log(`Pedido duplicado detectado para ${requestKey} -- reusando la resolución en curso en vez de arrancar otra.`);
+        return inFlightRequests.get(requestKey);
+    }
+
+    const resultPromise = resolveStreamRequest(args);
+    inFlightRequests.set(requestKey, resultPromise);
+    try {
+        return await resultPromise;
+    } finally {
+        inFlightRequests.delete(requestKey);
+    }
+});
+
+async function resolveStreamRequest(args) {
     const [imdbId, season, episode] = args.id.split(':');
     
     // Cinemeta puede darnos varias variantes de título (nombre original en inglés,
@@ -1099,7 +1124,7 @@ builder.defineStreamHandler(async (args) => {
     }));
 
     return { streams: stremioStreams.filter(stream => stream !== null) };
-});
+}
 
 const port = process.env.PORT || 7000;
 
