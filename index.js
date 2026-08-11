@@ -8,6 +8,20 @@ const axios = require('axios');
 // numérico en sus URLs (/serie/94997/..., /pelicula/1368337/...).
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 
+// Convierte un título a slug tipo URL (ej: "La muerte de Robin Hood" ->
+// "la-muerte-de-robin-hood"), transliterando acentos/ñ en vez de perderlos.
+function slugify(text) {
+    if (!text) return '';
+    let s = text.toLowerCase();
+    const accents = { 'á':'a','é':'e','í':'i','ó':'o','ú':'u','ü':'u','à':'a','è':'e','ì':'i','ò':'o','ù':'u','ñ':'n','ç':'c' };
+    for (const [accented, plain] of Object.entries(accents)) {
+        s = s.split(accented).join(plain);
+    }
+    s = s.replace(/[^a-z0-9\s-]/g, '');
+    s = s.replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+    return s;
+}
+
 async function getTmdbId(imdbId, type) {
     if (!TMDB_API_KEY) return { id: null, esTitle: null };
     try {
@@ -957,7 +971,25 @@ builder.defineStreamHandler(async (args) => {
         }
         if (!usedCandidate && results.length > 0) usedCandidate = candidate;
     }
-    if (!searchResults || searchResults.length === 0) return { streams: [] };
+    const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
+
+    if (!searchResults || searchResults.length === 0) {
+        // El buscador de Poseidon no encontró NADA con ningún candidato de
+        // título -- pasa con estrenos muy recientes que el buscador interno
+        // todavía no indexó, aunque la página ya exista. Como Poseidon usa el
+        // ID de TMDB en sus URLs (/pelicula/{tmdbId}/{slug}/), si lo tenemos
+        // armamos la URL directo y probamos ahí antes de rendirnos.
+        if (tmdbId) {
+            const guessTitle = (tmdbResult && tmdbResult.esTitle) || usedCandidate || (titleCandidates[0]);
+            const guessSlug = slugify(guessTitle);
+            const guessUrl = `https://www.poseidonhd2.co${expectedPath}${tmdbId}/${guessSlug}/`;
+            console.log(`Sin resultados de búsqueda -- probando URL directa por TMDB ID: ${guessUrl}`);
+            searchResults = [{ url: guessUrl, title: guessTitle }];
+            usedCandidate = guessTitle;
+        } else {
+            return { streams: [] };
+        }
+    }
 
     // Entre los resultados del tipo correcto (película o serie), buscamos un
     // match EXACTO por ID de TMDB.
@@ -970,7 +1002,6 @@ builder.defineStreamHandler(async (args) => {
     // simplemente no esté en el sitio, así que preferimos devolver vacío.
     // El matching por palabras queda solo como último recurso para el caso
     // (raro) en que ni siquiera tengamos un tmdbId disponible.
-    const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
     let target = null;
     if (tmdbId) {
         const idRegex = new RegExp(expectedPath + tmdbId + '(?:/|$)');
