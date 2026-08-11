@@ -939,9 +939,16 @@ builder.defineStreamHandler(async (args) => {
     let searchResults = [];
     let usedCandidate = null;
     const seenUrls = new Set();
-    for (const candidate of titleCandidates) {
-        const results = await searchPoseidon2hd(candidate);
-        console.log(`Búsqueda con "${candidate}" -> ${results.length} resultado(s): ` + JSON.stringify(results.map(r => r.url)));
+    // Las 3 búsquedas se hacen en PARALELO (no una por una) para no perder
+    // tiempo -- la latencia de red es lo que domina acá, así que en paralelo
+    // el total tarda lo que tarda la más lenta, no la suma de las 3.
+    const allResults = await Promise.all(titleCandidates.map(candidate =>
+        searchPoseidon2hd(candidate).then(results => {
+            console.log(`Búsqueda con "${candidate}" -> ${results.length} resultado(s): ` + JSON.stringify(results.map(r => r.url)));
+            return { candidate, results };
+        })
+    ));
+    for (const { candidate, results } of allResults) {
         for (const r of results) {
             if (!seenUrls.has(r.url)) {
                 seenUrls.add(r.url);
