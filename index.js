@@ -1,6 +1,31 @@
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
+
+// API key gratuita de TMDB (mismo proyecto que usás en el addon de LaMovie,
+// se puede reusar la misma key sin problema). Se usa para conseguir el ID de
+// TMDB de forma confiable por IMDb ID, ya que Poseidon usa ese mismo ID
+// numérico en sus URLs (/serie/94997/..., /pelicula/1368337/...).
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+
+async function getTmdbId(imdbId, type) {
+    if (!TMDB_API_KEY) return null;
+    try {
+        const resp = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
+            params: { api_key: TMDB_API_KEY, external_source: 'imdb_id' },
+            timeout: 6000
+        });
+        const key = type === 'series' ? 'tv_results' : 'movie_results';
+        const results = resp.data && resp.data[key];
+        if (results && results.length > 0) {
+            return String(results[0].id);
+        }
+        return null;
+    } catch (e) {
+        console.log('Error consultando TMDB find:', e.message);
+        return null;
+    }
+}
 const puppeteer = require('puppeteer');
 const { URL } = require('url');
 
@@ -888,6 +913,13 @@ builder.defineStreamHandler(async (args) => {
         return { streams: [] };
     }
 
+    // El ID de TMDB es la forma más confiable de identificar el contenido
+    // (determinístico, no depende de idioma ni de coincidencias de texto).
+    // Lo pedimos directo a la API de TMDB primero (más confiable que
+    // depender de que Cinemeta lo tenga cargado), y si eso falla, usamos el
+    // que trajo Cinemeta como respaldo.
+    const tmdbId = await getTmdbId(imdbId, args.type) || tmdbIdFromMeta;
+
     titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
     if (titleCandidates.length === 0) return { streams: [] };
 
@@ -900,17 +932,29 @@ builder.defineStreamHandler(async (args) => {
     }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
 
-    // Entre los resultados del tipo correcto (película o serie), primero intentamos
-    // un match EXACTO por ID de TMDB (determinístico, no depende del idioma del
-    // título). Si no lo tenemos o no aparece, recién ahí caemos al puntaje por
-    // palabras como respaldo.
+    // Entre los resultados del tipo correcto (película o serie), buscamos un
+    // match EXACTO por ID de TMDB.
+    //
+    // IMPORTANTE: si tenemos un tmdbId confirmado y NINGÚN resultado de la
+    // búsqueda lo tiene, NO caemos al matching por palabras -- eso fue lo que
+    // causaba el bug de devolver una serie totalmente distinta cuando la
+    // buscada no está en Poseidon. Si Poseidon usa IDs de TMDB en sus URLs y
+    // no encontramos ese ID exacto, lo más probable es que ese contenido
+    // simplemente no esté en el sitio, así que preferimos devolver vacío.
+    // El matching por palabras queda solo como último recurso para el caso
+    // (raro) en que ni siquiera tengamos un tmdbId disponible.
     const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
     let target = null;
-    if (tmdbIdFromMeta) {
-        const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
+    if (tmdbId) {
+        const idRegex = new RegExp(expectedPath + tmdbId + '(?:/|$)');
         target = searchResults.find(r => idRegex.test(r.url)) || null;
+        if (!target) {
+            console.log(`TMDB ID ${tmdbId} no encontrado en los resultados de Poseidon -- no se arriesga con un match por palabras.`);
+            return { streams: [] };
+        }
+    } else {
+        target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
     }
-    if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
     if (!target) return { streams: [] };
 
     let poseidonData = null;
