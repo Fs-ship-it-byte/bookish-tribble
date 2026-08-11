@@ -919,6 +919,7 @@ builder.defineStreamHandler(async (args) => {
     // depender de que Cinemeta lo tenga cargado), y si eso falla, usamos el
     // que trajo Cinemeta como respaldo.
     const tmdbId = await getTmdbId(imdbId, args.type) || tmdbIdFromMeta;
+    console.log(`imdbId=${imdbId} type=${args.type} tmdbId=${tmdbId}`);
 
     titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
     if (titleCandidates.length === 0) return { streams: [] };
@@ -926,8 +927,10 @@ builder.defineStreamHandler(async (args) => {
     // Probamos cada variante de título hasta que el buscador de Poseidon encuentre algo.
     let searchResults = [];
     let usedCandidate = null;
+    console.log('Candidatos de título a probar:', JSON.stringify(titleCandidates));
     for (const candidate of titleCandidates) {
         searchResults = await searchPoseidon2hd(candidate);
+        console.log(`Búsqueda con "${candidate}" -> ${searchResults.length} resultado(s): ` + JSON.stringify(searchResults.map(r => r.url)));
         if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
     }
     if (!searchResults || searchResults.length === 0) return { streams: [] };
