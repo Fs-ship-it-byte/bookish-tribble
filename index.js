@@ -1187,7 +1187,31 @@ app.get('/debug/streamwish', async (req, res) => {
 
     const trace = [];
     const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
-    res.send(trace.join('\n') + '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)'));
+
+    let fetchTest = 'no se intentó (no hubo resultado)';
+    if (result && result.url) {
+        const t0 = Date.now();
+        try {
+            const r = await axios.get(result.url, {
+                headers: result.headers,
+                timeout: 10000,
+                validateStatus: () => true, // queremos ver el código igual si es 403/404
+                responseType: 'text',
+                transformResponse: [(d) => d],
+            });
+            const ms = Date.now() - t0;
+            const preview = typeof r.data === 'string' ? r.data.slice(0, 300) : '(no-texto)';
+            fetchTest = `HTTP ${r.status} en ${ms}ms, pedido ${(Date.now() - t0)}ms después de resolver.\nPrimeros 300 chars del body:\n${preview}`;
+        } catch (e) {
+            fetchTest = `Fetch falló: ${e.message}`;
+        }
+    }
+
+    res.send(
+        trace.join('\n') +
+        '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)') +
+        '\n\n--- Test de fetch inmediato desde ESTE server, mismos headers ---\n' + fetchTest
+    );
 });
 
 app.get('/debug/series', async (req, res) => {
