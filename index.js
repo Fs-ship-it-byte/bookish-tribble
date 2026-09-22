@@ -1195,13 +1195,41 @@ app.get('/debug/streamwish', async (req, res) => {
             const r = await axios.get(result.url, {
                 headers: result.headers,
                 timeout: 10000,
-                validateStatus: () => true, // queremos ver el código igual si es 403/404
+                validateStatus: () => true,
                 responseType: 'text',
                 transformResponse: [(d) => d],
             });
             const ms = Date.now() - t0;
             const preview = typeof r.data === 'string' ? r.data.slice(0, 300) : '(no-texto)';
             fetchTest = `HTTP ${r.status} en ${ms}ms, pedido ${(Date.now() - t0)}ms después de resolver.\nPrimeros 300 chars del body:\n${preview}`;
+
+            // Si el master.m3u8 se pudo leer, seguimos la cadena: sub-playlist
+            // (con y sin headers) y el primer segmento .ts (con y sin headers),
+            // para saber EXACTAMENTE qué nivel exige los headers.
+            if (r.status === 200 && typeof r.data === 'string') {
+                const baseUrl = result.url.replace(/\/[^/]*$/, '');
+                const lines = r.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                const subLine = lines.find((l) => !l.startsWith('#'));
+                if (subLine) {
+                    const subUrl = /^https?:\/\//i.test(subLine) ? subLine : `${baseUrl}/${subLine}`;
+
+                    const subWith = await axios.get(subUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                    const subWithout = await axios.get(subUrl, { timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                    fetchTest += `\n\nSub-playlist (${subUrl}):\n  CON headers -> HTTP ${subWith.status}\n  SIN headers -> HTTP ${subWithout.status}`;
+
+                    if (subWith.status === 200 && typeof subWith.data === 'string') {
+                        const subBase = subUrl.replace(/\/[^/]*$/, '');
+                        const subLines = subWith.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                        const segLine = subLines.find((l) => !l.startsWith('#'));
+                        if (segLine) {
+                            const segUrl = /^https?:\/\//i.test(segLine) ? segLine : `${subBase}/${segLine}`;
+                            const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                            const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                            fetchTest += `\n\nSegmento .ts (${segUrl}):\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
+                        }
+                    }
+                }
+            }
         } catch (e) {
             fetchTest = `Fetch falló: ${e.message}`;
         }
@@ -1212,6 +1240,17 @@ app.get('/debug/streamwish', async (req, res) => {
         '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)') +
         '\n\n--- Test de fetch inmediato desde ESTE server, mismos headers ---\n' + fetchTest
     );
+});
+
+app.get('/debug/movie', async (req, res) => {
+    const imdbId = req.query.imdb;
+    if (!imdbId) return res.status(400).json({ error: 'Falta ?imdb=ttXXXXXXX' });
+    try {
+        const result = await resolveStreamRequest({ type: 'movie', id: imdbId });
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message, stack: e.stack });
+    }
 });
 
 app.get('/debug/series', async (req, res) => {
