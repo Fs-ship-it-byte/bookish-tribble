@@ -173,14 +173,14 @@ function patchDtoE(url) {
 // Solución: nuestro propio servidor reproxea TODO (m3u8 y cada segmento .ts),
 // siempre con la misma IP/headers, y el reproductor solo habla con nosotros.
 
-const { encodeSignedToken, decodeSignedToken, requireDebugAuth } = require('./proxysec');
-
 function encodeProxyToken(url, headers) {
-    return encodeSignedToken({ url: url, headers: headers || {} });
+    return Buffer.from(JSON.stringify({ url: url, headers: headers || {} }), 'utf8').toString('base64url');
 }
 
 function decodeProxyToken(token) {
-    return decodeSignedToken(token);
+    try {
+        return JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+    } catch (e) { return null; }
 }
 
 // Construye la URL absoluta de nuestro proxy que le vamos a dar a Stremio/VLC
@@ -1162,8 +1162,6 @@ const port = process.env.PORT || 7000;
 const app = express();
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
 app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
-
-app.use('/debug', requireDebugAuth);
 
 // --- DIAGNÓSTICO TEMPORAL para series ---
 // Uso: /debug/series?imdb=tt0000000&season=1&episode=1
