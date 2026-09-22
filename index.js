@@ -173,14 +173,14 @@ function patchDtoE(url) {
 // Solución: nuestro propio servidor reproxea TODO (m3u8 y cada segmento .ts),
 // siempre con la misma IP/headers, y el reproductor solo habla con nosotros.
 
+const { encodeSignedToken, decodeSignedToken, requireDebugAuth } = require('./proxysec');
+
 function encodeProxyToken(url, headers) {
-    return Buffer.from(JSON.stringify({ url: url, headers: headers || {} }), 'utf8').toString('base64url');
+    return encodeSignedToken({ url: url, headers: headers || {} });
 }
 
 function decodeProxyToken(token) {
-    try {
-        return JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
-    } catch (e) { return null; }
+    return decodeSignedToken(token);
 }
 
 // Construye la URL absoluta de nuestro proxy que le vamos a dar a Stremio/VLC
@@ -192,6 +192,34 @@ function buildProxyPlaylistUrl(targetUrl, headers) {
 
 function isM3u8Url(u) {
     return /\.m3u8(\?|#|$)/i.test(u);
+}
+
+// Por default probamos entrega DIRECTA: le pasamos a Stremio la URL real del
+// CDN + los headers (Referer/Origin/User-Agent) en behaviorHints.proxyHeaders,
+// igual que ya funciona en el addon de la movie. Es una prueba concreta a la
+// teoría de que el 403 de streamwish/niramirus es por headers, no por IP --
+// si el token de verdad estuviera atado a la IP que lo negoció (como decía el
+// comentario viejo de este archivo), esto va a seguir fallando y hay que
+// volver a poner USE_PROXY=1.
+const USE_PROXY = process.env.USE_PROXY === '1';
+
+function buildStreamResult(name, description, targetUrl, headers) {
+    if (USE_PROXY) {
+        return {
+            name,
+            description,
+            url: buildProxyPlaylistUrl(targetUrl, headers)
+        };
+    }
+    return {
+        name,
+        description,
+        url: targetUrl,
+        behaviorHints: {
+            notWebReady: true,
+            proxyHeaders: headers ? { request: headers } : undefined
+        }
+    };
 }
 
 // Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
@@ -1062,12 +1090,12 @@ async function resolveStreamRequest(args) {
             directUrl = await resolveVidHideHls(s.playerUrl);
             
             if (directUrl) {
-                // Reproxeamos también acá: mismo motivo que abajo (token atado a IP/headers).
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel,
-                    url: buildProxyPlaylistUrl(directUrl, { 'User-Agent': PS_UA['User-Agent'] })
-                };
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel,
+                    directUrl,
+                    { 'User-Agent': PS_UA['User-Agent'] }
+                );
             }
         }
 
@@ -1078,11 +1106,12 @@ async function resolveStreamRequest(args) {
             //     con un window.location simple o ya traen el m3u8 en el HTML plano.
             const swDataFast = await resolveStreamwishHls(embedUrl);
             if (swDataFast && swDataFast.url) {
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel + "\n(Directo)",
-                    url: buildProxyPlaylistUrl(swDataFast.url, swDataFast.headers)
-                };
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    swDataFast.url,
+                    swDataFast.headers
+                );
             }
 
             // 2b. Intento con navegador headless: necesario cuando el salto de
@@ -1090,25 +1119,27 @@ async function resolveStreamRequest(args) {
             //     m3u8 solo ocurren ejecutando el JS real del sitio.
             const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
             if (swDataBrowser && swDataBrowser.url) {
-                // IMPORTANTE: no le pasamos la URL cruda de hgplaycdn al reproductor.
-                // El token del m3u8 quedó atado a la IP/headers con los que
-                // Puppeteer lo negoció; si el celular/PC la pide directo, el CDN
-                // la rechaza. Por eso TODO pasa por nuestro propio proxy.
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel + "\n(Directo)",
-                    url: buildProxyPlaylistUrl(swDataBrowser.url, swDataBrowser.headers)
-                };
+                // Antes esto SIEMPRE iba por nuestro proxy asumiendo que el token
+                // estaba atado a la IP. Probamos entrega directa con proxyHeaders
+                // primero (ver USE_PROXY arriba) para confirmar si alcanza con los
+                // headers o si de verdad hace falta el proxy.
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    swDataBrowser.url,
+                    swDataBrowser.headers
+                );
             }
 
             // 2c. Intento genérico legacy (por si acaso)
             const directData = await resolveDirectVideoUrl(embedUrl);
             if (directData && directData.url) {
-                return {
-                    name: "PoseidonHD",
-                    description: cleanLabel + "\n(Directo)",
-                    url: buildProxyPlaylistUrl(directData.url, directData.headers)
-                };
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    directData.url,
+                    directData.headers
+                );
             }
             
             // Backup por si falla toda la extracción: si aun así preferís
@@ -1131,6 +1162,8 @@ const port = process.env.PORT || 7000;
 const app = express();
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
 app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
+
+app.use('/debug', requireDebugAuth);
 
 // --- DIAGNÓSTICO TEMPORAL para series ---
 // Uso: /debug/series?imdb=tt0000000&season=1&episode=1
