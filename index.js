@@ -149,6 +149,80 @@ function extractHlsFromCallistanise(code, base) {
     return null;
 }
 
+// ==========================================
+// VALIDACIÓN DE CANDIDATOS (evita señuelos/publicidad)
+// ==========================================
+// Puerto de la lógica que encontramos en un fork de PeliApi: un regex que
+// matchea "algo con .m3u8" puede matchear perfectamente un link de
+// publicidad (vimos un caso real: un segmento servido desde un host de
+// TikTok CDN, con extensión .image, mezclado en medio de un master.m3u8
+// real). Antes de aceptar un candidato como bueno, lo bajamos de verdad y
+// chequeamos que sea un m3u8 real y que sus segmentos no vengan de un host
+// conocido de publicidad/tracking.
+function isSuspiciousSegmentUrl(url) {
+    try {
+        var parsed = new URL(url);
+        var host = parsed.hostname.toLowerCase();
+        var pathname = parsed.pathname.toLowerCase();
+        if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
+        if (pathname.endsWith('.image') || pathname.indexOf('/ad-site-') !== -1) return true;
+        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
+        return false;
+    } catch (e) { return false; }
+}
+
+async function validateHlsCandidate(candidateUrl, headers, depth) {
+    depth = depth || 0;
+    if (depth > 3) return null;
+    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
+
+    var text;
+    try {
+        var r = await axios.get(candidateUrl, {
+            headers: headers,
+            timeout: 10000,
+            responseType: 'text',
+            transformResponse: [(d) => d],
+        });
+        text = r.data;
+    } catch (e) { return null; }
+
+    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
+
+    var lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    // Master playlist: bajamos a la mejor variante y validamos ESA, no el master.
+    if (text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+        var bestUrl = null, bestScore = -1;
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('#EXT-X-STREAM-INF') === -1) continue;
+            var resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
+            var score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
+            for (var j = i + 1; j < lines.length; j++) {
+                if (lines[j].startsWith('#')) continue;
+                var variant = new URL(lines[j], candidateUrl).href;
+                if (score > bestScore) { bestScore = score; bestUrl = variant; }
+                break;
+            }
+        }
+        if (!bestUrl) return null;
+        return validateHlsCandidate(bestUrl, headers, depth + 1);
+    }
+
+    // Media playlist: chequeamos que los segmentos reales no sean señuelos.
+    var segLines = lines.filter((l) => !l.startsWith('#'));
+    if (segLines.length === 0) return null;
+    var sample = segLines.slice(0, 10);
+    for (var s = 0; s < sample.length; s++) {
+        var segUrl = new URL(sample[s], candidateUrl).href;
+        if (isSuspiciousSegmentUrl(segUrl)) {
+            console.warn('[SW] candidato rechazado, segmento sospechoso:', segUrl);
+            return null;
+        }
+    }
+    return candidateUrl; // este es el nivel (master o variante) que hay que devolver, no el segmento
+}
+
 // Añadidos más dominios mutantes de Streamwish
 const EMBED_HOSTS = [
     'streamwish', 'niramirus', 'filemoon', 'embedwish', 'vidhide',
@@ -194,36 +268,33 @@ function isM3u8Url(u) {
     return /\.m3u8(\?|#|$)/i.test(u);
 }
 
-// Por default probamos entrega DIRECTA: le pasamos a Stremio la URL real del
-// CDN + los headers (Referer/Origin/User-Agent) en behaviorHints.proxyHeaders,
-// igual que ya funciona en el addon de la movie. Es una prueba concreta a la
-// teoría de que el 403 de streamwish/niramirus es por headers, no por IP --
-// si el token de verdad estuviera atado a la IP que lo negoció (como decía el
-// comentario viejo de este archivo), esto va a seguir fallando y hay que
-// volver a poner USE_PROXY=1.
+// USE_PROXY=1 -> proxy viejo completo (TODO pasa por nuestro servidor,
+//   incluidos los segmentos .ts -- máxima compatibilidad, máximo gasto de
+//   banda). Sirve de red de contención si algún proveedor puntual sí exige
+//   headers en los segmentos.
+// USE_PROXY sin setear (default) -> proxy "liviano": el manifest (.m3u8,
+//   texto, KB) pasa por nuestro servidor con los headers correctos, así
+//   funciona en CUALQUIER cliente (soluciona el bug de Android que no
+//   aplicaba bien proxyHeaders) -- pero los segmentos .ts (el video real,
+//   los GB) van directo al CDN, sin gastar banda nuestra.
 const USE_PROXY = process.env.USE_PROXY === '1';
 
 function buildStreamResult(name, description, targetUrl, headers) {
-    if (USE_PROXY) {
-        return {
-            name,
-            description,
-            url: buildProxyPlaylistUrl(targetUrl, headers)
-        };
-    }
     return {
         name,
         description,
-        url: targetUrl,
-        behaviorHints: {
-            notWebReady: true,
-            proxyHeaders: headers ? { request: headers } : undefined
-        }
+        url: buildProxyPlaylistUrl(targetUrl, headers)
     };
 }
 
-// Reescribe un playlist .m3u8: cada línea de URI (sub-playlist o segmento) pasa
-// a apuntar a nuestro propio proxy, conservando los headers originales.
+// Reescribe un playlist .m3u8: las sub-playlists (texto, KB) siguen pasando
+// por NUESTRO proxy, para garantizar que los headers se apliquen siempre
+// del lado del servidor (sin depender de que el cliente de Stremio los
+// mande bien -- que es justo lo que falla en Android). Pero los SEGMENTOS
+// (.ts, los GB reales, el costo de ancho de banda) van DIRECTO al CDN real,
+// sin pasar por nuestro proxy -- si el CDN no exige headers para servirlos
+// (como confirmamos en varios casos), el reproductor los baja solo, sin
+// gastarnos banda a nosotros.
 //
 // IMPORTANTE: no decidimos "sub-playlist vs segmento" por la EXTENSIÓN del
 // archivo (algunos sitios, como este, nombran sus sub-playlists con ".txt" en
@@ -251,8 +322,9 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
                 });
             }
 
-            // #EXT-X-KEY / #EXT-X-MAP: su URI sí es un recurso binario (clave de
-            // cifrado / segmento de inicialización), va por el proxy de segmentos.
+            // #EXT-X-KEY / #EXT-X-MAP: pesan casi nada (una clave o un header de
+            // inicialización), no vale la pena arriesgar que fallen sin headers
+            // -- siguen pasando por nuestro proxy de segmento (barato igual).
             const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
                 const token = encodeProxyToken(abs, headers);
@@ -269,12 +341,21 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
         const absUrl = /^https?:\/\//i.test(trimmed)
             ? trimmed
             : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
-        const token = encodeProxyToken(absUrl, headers);
         const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
         nextIsPlaylist = false;
-        return isPlaylist
-            ? `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`
-            : `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+
+        if (isPlaylist) {
+            const token = encodeProxyToken(absUrl, headers);
+            return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
+        }
+        // Segmento real: por default va DIRECTO al CDN (no gasta banda
+        // nuestra). Con USE_PROXY=1 también pasa por nuestro proxy, por si
+        // algún proveedor puntual exige headers en los segmentos.
+        if (USE_PROXY) {
+            const token = encodeProxyToken(absUrl, headers);
+            return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+        }
+        return absUrl;
     });
     return out.join('\n');
 }
@@ -582,10 +663,12 @@ async function resolveStreamwishHls(embedUrl) {
         var unpacked = unpackEvalBlocks(html);
         var hls = extractHlsFromCallistanise(unpacked + '\n' + html, origin);
         if (hls) {
-            return {
-                url: hls,
-                headers: { 'Referer': origin + '/', 'Origin': origin, 'User-Agent': PS_UA['User-Agent'] }
-            };
+            var candidateHeaders = { 'Referer': origin + '/', 'Origin': origin, 'User-Agent': PS_UA['User-Agent'] };
+            var validatedUrl = await validateHlsCandidate(hls, candidateHeaders);
+            if (validatedUrl) {
+                return { url: validatedUrl, headers: candidateHeaders };
+            }
+            console.warn('[SW] candidato descartado por validación, sigo buscando:', hls);
         }
 
         // 2. Si no hay video todavía, ver si la página redirige a un dominio mutante
@@ -1116,13 +1199,10 @@ async function resolveStreamRequest(args) {
 
             // 2b. Intento con navegador headless: necesario cuando el salto de
             //     dominio (streamwish.to -> niramirus.com, etc) y la carga del
-            //     m3u8 solo ocurren ejecutando el JS real del sitio.
+            //     m3u8 solo ocurren ejecutando el JS real del sitio, y el
+            //     camino rápido (2a) no encontró nada validable.
             const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
             if (swDataBrowser && swDataBrowser.url) {
-                // Antes esto SIEMPRE iba por nuestro proxy asumiendo que el token
-                // estaba atado a la IP. Probamos entrega directa con proxyHeaders
-                // primero (ver USE_PROXY arriba) para confirmar si alcanza con los
-                // headers o si de verdad hace falta el proxy.
                 return buildStreamResult(
                     "PoseidonHD",
                     cleanLabel + "\n(Directo)",
@@ -1207,22 +1287,20 @@ app.get('/debug/streamwish', async (req, res) => {
             // (con y sin headers) y el primer segmento .ts (con y sin headers),
             // para saber EXACTAMENTE qué nivel exige los headers.
             if (r.status === 200 && typeof r.data === 'string') {
-                const baseUrl = result.url.replace(/\/[^/]*$/, '');
                 const lines = r.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
                 const subLine = lines.find((l) => !l.startsWith('#'));
                 if (subLine) {
-                    const subUrl = /^https?:\/\//i.test(subLine) ? subLine : `${baseUrl}/${subLine}`;
+                    const subUrl = new URL(subLine, result.url).href;
 
                     const subWith = await axios.get(subUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
                     const subWithout = await axios.get(subUrl, { timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
                     fetchTest += `\n\nSub-playlist (${subUrl}):\n  CON headers -> HTTP ${subWith.status}\n  SIN headers -> HTTP ${subWithout.status}`;
 
                     if (subWith.status === 200 && typeof subWith.data === 'string') {
-                        const subBase = subUrl.replace(/\/[^/]*$/, '');
                         const subLines = subWith.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
                         const segLine = subLines.find((l) => !l.startsWith('#'));
                         if (segLine) {
-                            const segUrl = /^https?:\/\//i.test(segLine) ? segLine : `${subBase}/${segLine}`;
+                            const segUrl = new URL(segLine, subUrl).href;
                             const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
                             const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
                             fetchTest += `\n\nSegmento .ts (${segUrl}):\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
