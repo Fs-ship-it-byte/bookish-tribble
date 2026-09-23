@@ -698,6 +698,7 @@ async function getBrowser() {
     if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
     _browserInstance = await puppeteer.launch({
         headless: 'new',
+        protocolTimeout: 30000, // antes no estaba seteado -> podía colgarse minutos
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -708,10 +709,24 @@ async function getBrowser() {
     return _browserInstance;
 }
 
+// Límite de concurrencia para Puppeteer: con poca RAM, dos o más
+// resoluciones abriendo pestañas al mismo tiempo en el mismo Chromium
+// compartido pueden saturarlo y producir "Target.createTarget timed out".
+// Con esto, si ya hay una resolución de Puppeteer en curso, las demás
+// esperan su turno en vez de pelear por recursos al mismo tiempo.
+let _puppeteerQueue = Promise.resolve();
+function withPuppeteerLock(fn) {
+    const run = _puppeteerQueue.then(fn, fn);
+    // Encadenamos el "next" ignorando el resultado/error de este turno, para
+    // que un fallo en una resolución no trabe la cola para las siguientes.
+    _puppeteerQueue = run.then(() => undefined, () => undefined);
+    return run;
+}
+
 // Resuelve el .m3u8 real abriendo el embed en un navegador headless,
 // siguiendo todos los saltos de dominio que haga el propio JS del sitio,
 // e interceptando la request de red hacia el .m3u8 cuando se dispare.
-async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
+async function _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace) {
     timeoutMs = timeoutMs || 20000;
     let browser;
     let page;
@@ -849,6 +864,11 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
         return resolved;
     } catch (e) {
         t('ERROR general: ' + e.message);
+        if (/timed out|Target closed|Connection closed|Protocol error/i.test(e.message || '')) {
+            console.warn('[SW] Browser compartido parece roto, se descarta para relanzar uno limpio la próxima vez:', e.message);
+            try { if (_browserInstance) await _browserInstance.close(); } catch (_e) {}
+            _browserInstance = null;
+        }
         return null;
     } finally {
         if (browser && onTargetCreated) {
@@ -858,6 +878,13 @@ async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
             try { await page.close(); } catch (e) {}
         }
     }
+}
+
+// Wrapper público: corre la resolución vía Puppeteer a través del semáforo
+// (withPuppeteerLock), para que dos resoluciones no peleen por el mismo
+// Chromium compartido al mismo tiempo.
+async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
+    return withPuppeteerLock(() => _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace));
 }
 
 // ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
