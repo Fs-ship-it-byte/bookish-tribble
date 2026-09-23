@@ -209,16 +209,26 @@ async function validateHlsCandidate(candidateUrl, headers, depth) {
         return validateHlsCandidate(bestUrl, headers, depth + 1);
     }
 
-    // Media playlist: chequeamos que los segmentos reales no sean señuelos.
+    // Media playlist: solo rechazamos si TODOS los segmentos muestreados son
+    // sospechosos (señal de que este candidato es un señuelo completo, sin
+    // contenido real). Si aparece uno solo mezclado con reales, no lo
+    // descartamos: es normal que sitios con publicidad inserten un pre-roll
+    // como primer segmento del stream real (el reproductor lo pasa y sigue
+    // con el contenido real, como cualquier stream con anuncios).
     var segLines = lines.filter((l) => !l.startsWith('#'));
     if (segLines.length === 0) return null;
     var sample = segLines.slice(0, 10);
+    var suspiciousCount = 0;
     for (var s = 0; s < sample.length; s++) {
         var segUrl = new URL(sample[s], candidateUrl).href;
-        if (isSuspiciousSegmentUrl(segUrl)) {
-            console.warn('[SW] candidato rechazado, segmento sospechoso:', segUrl);
-            return null;
-        }
+        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
+    }
+    if (suspiciousCount === sample.length) {
+        console.warn('[SW] candidato rechazado, TODOS los segmentos muestreados son sospechosos (señuelo completo):', candidateUrl);
+        return null;
+    }
+    if (suspiciousCount > 0) {
+        console.log(`[SW] candidato aceptado con ${suspiciousCount}/${sample.length} segmentos de publicidad mezclados (pre-roll normal):`, candidateUrl);
     }
     return candidateUrl; // este es el nivel (master o variante) que hay que devolver, no el segmento
 }
@@ -1330,7 +1340,7 @@ app.get('/debug/streamwish', async (req, res) => {
                             const segUrl = new URL(segLine, subUrl).href;
                             const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
                             const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
-                            fetchTest += `\n\nSegmento .ts (${segUrl}):\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
+                            fetchTest += `\n\nSegmento .ts (${segUrl}) [ojo: puede ser un pre-roll de publicidad si el sitio inserta anuncios, no es necesariamente el contenido real]:\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
                         }
                     }
                 }
