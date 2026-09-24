@@ -90,8 +90,29 @@ function parseJsObjVh(str) {
     return null;
 }
 
+// Los embeds (vidhide / streamwish y clones) traen varios links en el mismo
+// objeto: hls4 = /stream/... en el dominio del propio embed (el que usa el
+// reproductor en el navegador; sus segmentos son públicos), hls3 = CDN de
+// StreamWish con playlists .txt y segmentos .woff2, hls2 = CDN firmado con
+// token atado a la red que pidió el embed (el que más falla). Antes se
+// devolvía el PRIMERO que apareciera, y el orden cambia entre pedidos.
+var HLS_KEY_PREFERENCE = ['hls4', 'hls3', 'hls2'];
+function isHlsLikeUrl(v) {
+    return typeof v === 'string' && /\.(?:m3u8|txt)(?:\?|#|$)/i.test(v);
+}
+function pickPreferredHls(obj, base) {
+    if (!obj) return null;
+    for (var i = 0; i < HLS_KEY_PREFERENCE.length; i++) {
+        var v = obj[HLS_KEY_PREFERENCE[i]];
+        if (isHlsLikeUrl(v)) return makeAbsoluteVh(v.replace(/\\\//g, '/'), base);
+    }
+    return null;
+}
+
 function extractM3u8FromObjVh(obj, base) {
     if (!obj) return null;
+    var preferred = pickPreferredHls(obj, base);
+    if (preferred) return preferred;
     var keys = Object.keys(obj);
     for (var i = 0; i < keys.length; i++) {
         var v = obj[keys[i]];
@@ -119,6 +140,8 @@ function extractHlsFromCallistanise(code, base) {
         if (vm) {
             var vo = parseJsObjVh(vm[1]);
             if (vo) {
+                var prefHls = pickPreferredHls(vo, base);
+                if (prefHls) return prefHls;
                 for (var ki = 0; ki < keys.length; ki++) {
                     var kv = vo[keys[ki]];
                     if (kv && kv.indexOf('.m3u8') !== -1) return makeAbsoluteVh(kv, base);
@@ -134,7 +157,7 @@ function extractHlsFromCallistanise(code, base) {
         for (var vi = 0; vi < anyVarM.length; vi++) {
             var vm2 = anyVarM[vi].match(/var\s+([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*=\s*(\{[^{}]{10,800}\})/);
             if (!vm2) continue;
-            if (vm2[2].indexOf('m3u8') === -1 && vm2[2].indexOf('/hls/') === -1) continue;
+            if (!/m3u8|\.txt|\/hls/i.test(vm2[2])) continue;
             var vo2 = parseJsObjVh(vm2[2]);
             if (!vo2) continue;
             var found = extractM3u8FromObjVh(vo2, base);
@@ -171,6 +194,10 @@ function isSuspiciousSegmentUrl(url) {
     } catch (e) { return false; }
 }
 
+// NOTA: ya no se usa en el flujo de resolución (ver resolveStreamwishHls): bajar
+// el candidato otra vez quema tokens de un solo uso y marcaba como publicidad
+// los segmentos reales servidos como ".image" desde tiktokcdn. Se deja definida
+// solo por si hace falta para diagnóstico manual.
 async function validateHlsCandidate(candidateUrl, headers, depth) {
     depth = depth || 0;
     if (depth > 3) return null;
@@ -274,8 +301,24 @@ function buildProxyPlaylistUrl(targetUrl, headers) {
     return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
 }
 
+// StreamWish nombra sus playlists .txt (master.txt, index-f1-v1-a1.txt,
+// iframes-...txt) y sus segmentos .woff2. Las .txt se tratan igual que las
+// .m3u8 (playlist -> proxy liviano, se reescribe); los .woff2 no son playlist,
+// así que siguen el camino de cualquier segmento (directo al CDN).
 function isM3u8Url(u) {
-    return /\.m3u8(\?|#|$)/i.test(u);
+    return /\.(m3u8|txt)(\?|#|$)/i.test(u);
+}
+
+// Hosts de publicidad/CDN público de TikTok: hay playlists (hls4) cuyos
+// segmentos reales viven ahí como ".image", firmados y con CORS abierto (*), o
+// sea que CUALQUIER cliente los baja directo. Aunque se use USE_PROXY=1 no
+// vale la pena gastar banda propia en ellos.
+var AD_HOSTS = [/(^|\.)tiktokcdn\.com$/i, /(^|\.)doubleclick\.net$/i, /(^|\.)googlesyndication\.com$/i];
+function isKnownAdHost(u) {
+    try {
+        var host = new URL(u).hostname.toLowerCase();
+        return AD_HOSTS.some(function (rx) { return rx.test(host); }) || u.toLowerCase().indexOf('/ad-site-') !== -1;
+    } catch (e) { return false; }
 }
 
 // USE_PROXY=1 -> proxy viejo completo (TODO pasa por nuestro servidor,
@@ -290,11 +333,19 @@ function isM3u8Url(u) {
 const USE_PROXY = process.env.USE_PROXY === '1';
 
 function buildStreamResult(name, description, targetUrl, headers) {
-    return {
+    const stream = {
         name,
         description,
         url: buildProxyPlaylistUrl(targetUrl, headers)
     };
+    // Masters .txt (CDN de StreamWish en Cloudflare, con CORS atado al origen
+    // del embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
+    // cliente al bajar los segmentos, sin pasar bytes por nuestro server.
+    // notWebReady => no funciona en Stremio Web (solo clientes con servidor local).
+    if (isM3u8Url(targetUrl) && /\.txt(\?|#|$)/i.test(targetUrl) && headers) {
+        stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: Object.assign({}, headers) } };
+    }
+    return stream;
 }
 
 // Reescribe un playlist .m3u8: las sub-playlists (texto, KB) siguen pasando
@@ -361,7 +412,7 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
         // Segmento real: por default va DIRECTO al CDN (no gasta banda
         // nuestra). Con USE_PROXY=1 también pasa por nuestro proxy, por si
         // algún proveedor puntual exige headers en los segmentos.
-        if (USE_PROXY) {
+        if (USE_PROXY && !isKnownAdHost(absUrl)) {
             const token = encodeProxyToken(absUrl, headers);
             return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
         }
@@ -578,14 +629,15 @@ async function resolveVidHideHls(url) {
             })).data;
         } catch(e) { continue; }
         
+        var calliHeaders = { 'Referer': calliUrl, 'Origin': base, 'User-Agent': PS_UA['User-Agent'] };
         var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\\|'\)\s*\)/im);
         if (em && em[1] !== undefined && em[2] !== undefined && em[3] !== undefined && em[4] !== undefined) {
             var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
             var hls = extractHlsFromCallistanise(decoded, base);
-            if (hls) return hls;
+            if (hls) return { url: hls, headers: calliHeaders };
         }
         var hls2 = extractHlsFromCallistanise(calliHtml, base);
-        if (hls2) return hls2;
+        if (hls2) return { url: hls2, headers: calliHeaders };
     }
     return null;
 }
@@ -673,12 +725,15 @@ async function resolveStreamwishHls(embedUrl) {
         var unpacked = unpackEvalBlocks(html);
         var hls = extractHlsFromCallistanise(unpacked + '\n' + html, origin);
         if (hls) {
+            // Sin pre-validar (validateHlsCandidate ya no se usa acá): estas URLs
+            // traen tokens firmados de vida corta y algunos son de un solo uso, así
+            // que bajarlas otra vez "para validar" quema el token o dispara un
+            // rechazo del CDN, y de paso descartaba streams legítimos: los
+            // segmentos reales de varios CDNs (morencius, acek-cdn) se sirven como
+            // ".image" desde tiktokcdn, y el chequeo los marcaba como publicidad.
+            // Se confía en lo que el resolver extrajo del sitio real.
             var candidateHeaders = { 'Referer': origin + '/', 'Origin': origin, 'User-Agent': PS_UA['User-Agent'] };
-            var validatedUrl = await validateHlsCandidate(hls, candidateHeaders);
-            if (validatedUrl) {
-                return { url: validatedUrl, headers: candidateHeaders };
-            }
-            console.warn('[SW] candidato descartado por validación, sigo buscando:', hls);
+            return { url: hls, headers: candidateHeaders };
         }
 
         // 2. Si no hay video todavía, ver si la página redirige a un dominio mutante
@@ -753,6 +808,15 @@ async function _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace) 
         let lastRefererByUrl = 'https://www.google.com/';
         let requestCount = 0;
         const seenHosts = new Set();
+        // El navegador manda Origin = origen de la PÁGINA que pide el video (p.ej.
+        // https://vibuxer.com), no el del CDN. Los CDNs con CORS atado al embed
+        // (StreamWish .txt) lo necesitan tal cual, así que lo derivamos del Referer.
+        let pageOrigin = null;
+        try { pageOrigin = new URL(embedUrl).origin; } catch (e) {}
+        const originFromReferer = (referer) => {
+            if (referer) { try { return new URL(referer).origin; } catch (e) {} }
+            return pageOrigin;
+        };
 
         onTargetCreated = async (target) => {
             try {
@@ -787,7 +851,7 @@ async function _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace) 
                     url: url,
                     headers: {
                         'Referer': req.headers()['referer'] || lastRefererByUrl,
-                        'Origin': new URL(url).origin,
+                        'Origin': originFromReferer(req.headers()['referer'] || lastRefererByUrl),
                         'User-Agent': PS_UA['User-Agent']
                     }
                 };
@@ -806,7 +870,7 @@ async function _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace) 
                         url: rUrl,
                         headers: {
                             'Referer': resp.request().headers()['referer'] || lastRefererByUrl,
-                            'Origin': new URL(rUrl).origin,
+                            'Origin': originFromReferer(resp.request().headers()['referer'] || lastRefererByUrl),
                             'User-Agent': PS_UA['User-Agent']
                         }
                     };
@@ -1202,19 +1266,18 @@ async function resolveStreamRequest(args) {
     if (!poseidonData || !poseidonData.streams) return { streams: [] };
 
     const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
-        let directUrl = null;
         let cleanLabel = s.label.replace(' (DL)', '');
         
         // 1. Resolver VidHide
         if (s.label.toLowerCase().includes('vidhide')) {
-            directUrl = await resolveVidHideHls(s.playerUrl);
+            const vhData = await resolveVidHideHls(s.playerUrl);
             
-            if (directUrl) {
+            if (vhData && vhData.url) {
                 return buildStreamResult(
                     "PoseidonHD",
                     cleanLabel,
-                    directUrl,
-                    { 'User-Agent': PS_UA['User-Agent'] }
+                    vhData.url,
+                    vhData.headers
                 );
             }
         }
