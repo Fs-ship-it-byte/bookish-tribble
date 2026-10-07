@@ -1,6 +1,10 @@
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
+const dns = require('dns');
+const net = require('net');
+const { AsyncLocalStorage } = require('async_hooks');
 
 // API key gratuita de TMDB (mismo proyecto que usás en el addon de LaMovie,
 // se puede reusar la misma key sin problema). Se usa para conseguir el ID de
@@ -45,9 +49,82 @@ async function getTmdbId(imdbId, type) {
 const puppeteer = require('puppeteer');
 const { URL } = require('url');
 
-// URL pública donde queda expuesto este addon (ver más abajo). Se usa para
-// construir las URLs del proxy de HLS que le entregamos al reproductor.
-const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || 7000}`).replace(/\/+$/, '');
+// ---------------------------------------------------------------------------
+// Configuración obligatoria del gateway. Si falta algo, el servidor NO arranca.
+//   GATEWAY_SECRET     = el mismo valor que en el Worker
+//   PROXY_SIGNING_KEY  = el mismo valor que en el Worker
+//   PLAYLIST_BASE_URL  = https://<tu-worker>.workers.dev/hls/shen   (sin barra final)
+// Las playlists se entregan por el gateway (la antigua variable de URL pública ya no se usa).
+// ---------------------------------------------------------------------------
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
+const PROXY_SIGNING_KEY = process.env.PROXY_SIGNING_KEY || '';
+const PLAYLIST_BASE_URL = (process.env.PLAYLIST_BASE_URL || '').replace(/\/+$/, '');
+{
+    const problems = [];
+    if (GATEWAY_SECRET.length < 16) problems.push('GATEWAY_SECRET (mínimo 16 caracteres)');
+    if (PROXY_SIGNING_KEY.length < 16) problems.push('PROXY_SIGNING_KEY (mínimo 16 caracteres)');
+    if (!/^https:\/\/[^/]+\/hls\/[a-z0-9_-]+$/.test(PLAYLIST_BASE_URL)) problems.push('PLAYLIST_BASE_URL (debe ser https://<gateway>/hls/<addon>, sin barra final)');
+    if (problems.length) {
+        console.error('Configuración inválida o incompleta: ' + problems.join(', '));
+        process.exit(1);
+    }
+}
+const ENABLE_DEBUG = process.env.ENABLE_DEBUG === '1';
+
+// Cuenta (X-Account-Id, la pone el gateway) de la petición en curso. El manejador de streams
+// del SDK solo recibe `args`, así que la cuenta viaja por el contexto asíncrono de la petición.
+const acctStore = new AsyncLocalStorage();
+
+// ---------------------------------------------------------------------------
+// Protección contra SSRF SOLO en los dos proxies de HLS (no toca a los resolvers):
+// nunca se conecta a localhost / IPs privadas, ni tras redirects ni por DNS engañoso.
+// ---------------------------------------------------------------------------
+function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) {
+        const [a, b] = ip.split('.').map(Number);
+        return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+            (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    }
+    if (net.isIPv6(ip)) {
+        const x = ip.toLowerCase();
+        if (x === '::1' || x === '::') return true;
+        if (x.startsWith('fe80') || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('ff')) return true;
+        const m4 = x.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+        if (m4) return isPrivateIp(m4[1]);
+        const mh = x.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (mh) {
+            const hi = parseInt(mh[1], 16), lo = parseInt(mh[2], 16);
+            return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+        }
+        return false;
+    }
+    return true; // no es una IP válida
+}
+function assertPublicTarget(rawUrl) {
+    let u;
+    try { u = new URL(rawUrl); } catch (e) { throw new Error('URL inválida'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Protocolo no permitido');
+    const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+        throw new Error('Destino no permitido');
+    }
+    if (net.isIP(host) && isPrivateIp(host)) throw new Error('Destino no permitido');
+}
+async function assertPublicTargetDns(rawUrl) {
+    assertPublicTarget(rawUrl);
+    const host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(host)) return;
+    const addrs = await dns.promises.lookup(host, { all: true });
+    if (!addrs.length || addrs.some((x) => isPrivateIp(x.address))) throw new Error('Destino no permitido');
+}
+// Opciones por petición (no globales): pocos redirects y cada salto se revisa.
+const PROXY_NET_OPTS = {
+    maxRedirects: 3,
+    beforeRedirect: (options) => {
+        assertPublicTarget(`${options.protocol || 'https:'}//${options.hostname || options.host}`);
+    }
+};
 
 const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
 
@@ -284,21 +361,41 @@ function patchDtoE(url) {
 // Solución: nuestro propio servidor reproxea TODO (m3u8 y cada segmento .ts),
 // siempre con la misma IP/headers, y el reproductor solo habla con nosotros.
 
-function encodeProxyToken(url, headers) {
-    return Buffer.from(JSON.stringify({ url: url, headers: headers || {} }), 'utf8').toString('base64url');
+// Token firmado: base64url(JSON) + "." + base64url(HMAC-SHA256(PROXY_SIGNING_KEY, esa parte)).
+// Lleva url, headers, acct (id de cuenta, lo pone el gateway) y title, y caduca a las 12 h.
+// El gateway verifica la misma firma con la misma clave.
+const TOKEN_TTL_SECONDS = 12 * 3600;
+function signTokenBody(body) {
+    return crypto.createHmac('sha256', PROXY_SIGNING_KEY).update(body).digest('base64url');
+}
+function encodeProxyToken(url, headers, meta) {
+    const payload = { url: url, headers: headers || {}, exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS };
+    if (meta && meta.acct) payload.acct = String(meta.acct);
+    if (meta && meta.title) payload.title = String(meta.title).slice(0, 100);
+    const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    return body + '.' + signTokenBody(body);
 }
 
 function decodeProxyToken(token) {
     try {
-        return JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+        const t = String(token);
+        const i = t.lastIndexOf('.');
+        if (i < 1) return null;
+        const body = t.slice(0, i);
+        const given = Buffer.from(t.slice(i + 1));
+        const expected = Buffer.from(signTokenBody(body));
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+        const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (!p || typeof p.url !== 'string' || typeof p.exp !== 'number' || p.exp < Date.now() / 1000) return null;
+        return p;
     } catch (e) { return null; }
 }
 
 // Construye la URL absoluta de nuestro proxy que le vamos a dar a Stremio/VLC
 // en vez de la URL cruda del CDN.
-function buildProxyPlaylistUrl(targetUrl, headers) {
-    const token = encodeProxyToken(targetUrl, headers);
-    return `${PUBLIC_URL}/hlsproxy/playlist/${token}/master.m3u8`;
+function buildProxyPlaylistUrl(targetUrl, headers, meta) {
+    const token = encodeProxyToken(targetUrl, headers, meta);
+    return `${PLAYLIST_BASE_URL}/playlist/${token}/master.m3u8`;
 }
 
 // StreamWish nombra sus playlists .txt (master.txt, index-f1-v1-a1.txt,
@@ -332,11 +429,11 @@ function isKnownAdHost(u) {
 //   los GB) van directo al CDN, sin gastar banda nuestra.
 const USE_PROXY = process.env.USE_PROXY === '1';
 
-function buildStreamResult(name, description, targetUrl, headers) {
+function buildStreamResult(name, description, targetUrl, headers, meta) {
     const stream = {
         name,
         description,
-        url: buildProxyPlaylistUrl(targetUrl, headers)
+        url: buildProxyPlaylistUrl(targetUrl, headers, meta)
     };
     // Masters .txt (CDN de StreamWish en Cloudflare, con CORS atado al origen
     // del embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
@@ -362,7 +459,7 @@ function buildStreamResult(name, description, targetUrl, headers) {
 // vez de ".m3u8"), sino por la ETIQUETA que las precede en el propio m3u8:
 // #EXT-X-STREAM-INF siempre indica que la línea siguiente es una sub-playlist,
 // sin importar cómo se llame el archivo.
-function rewriteM3u8(playlistText, baseUrl, headers) {
+function rewriteM3u8(playlistText, baseUrl, headers, meta) {
     const lines = playlistText.split(/\r?\n/);
     let nextIsPlaylist = false;
 
@@ -378,8 +475,8 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
                 return line.replace(/URI="([^"]+)"/i, (m, uri) => {
                     const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
-                    const token = encodeProxyToken(abs, headers);
-                    return `URI="${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8"`;
+                    const token = encodeProxyToken(abs, headers, meta);
+                    return `URI="${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8"`;
                 });
             }
 
@@ -388,8 +485,8 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
             // -- siguen pasando por nuestro proxy de segmento (barato igual).
             const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
                 const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
-                const token = encodeProxyToken(abs, headers);
-                return `URI="${PUBLIC_URL}/hlsproxy/segment/${token}/seg"`;
+                const token = encodeProxyToken(abs, headers, meta);
+                return `URI="${PLAYLIST_BASE_URL}/segment/${token}/seg"`;
             });
 
             // Si esta etiqueta es #EXT-X-STREAM-INF, la línea SIGUIENTE (sin #)
@@ -406,15 +503,15 @@ function rewriteM3u8(playlistText, baseUrl, headers) {
         nextIsPlaylist = false;
 
         if (isPlaylist) {
-            const token = encodeProxyToken(absUrl, headers);
-            return `${PUBLIC_URL}/hlsproxy/playlist/${token}/sub.m3u8`;
+            const token = encodeProxyToken(absUrl, headers, meta);
+            return `${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8`;
         }
         // Segmento real: por default va DIRECTO al CDN (no gasta banda
         // nuestra). Con USE_PROXY=1 también pasa por nuestro proxy, por si
         // algún proveedor puntual exige headers en los segmentos.
         if (USE_PROXY && !isKnownAdHost(absUrl)) {
-            const token = encodeProxyToken(absUrl, headers);
-            return `${PUBLIC_URL}/hlsproxy/segment/${token}/seg`;
+            const token = encodeProxyToken(absUrl, headers, meta);
+            return `${PLAYLIST_BASE_URL}/segment/${token}/seg`;
         }
         return absUrl;
     });
@@ -426,17 +523,20 @@ async function handleHlsPlaylistProxy(req, res) {
     if (!data) return res.status(400).send('Token inválido');
 
     try {
+        await assertPublicTargetDns(data.url);
         const upstream = await axios.get(data.url, {
             headers: data.headers,
             timeout: 15000,
             responseType: 'text',
-            transformResponse: [(d) => d]
+            transformResponse: [(d) => d],
+            ...PROXY_NET_OPTS
         });
-        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers);
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, { acct: data.acct, title: data.title });
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
     } catch (e) {
+        console.log('Playlist no disponible:', e.message);
         res.status(502).send('No se pudo obtener el playlist');
     }
 }
@@ -446,10 +546,12 @@ async function handleHlsSegmentProxy(req, res) {
     if (!data) return res.status(400).send('Token inválido');
 
     try {
+        await assertPublicTargetDns(data.url);
         const upstream = await axios.get(data.url, {
             headers: data.headers,
             timeout: 20000,
-            responseType: 'stream'
+            responseType: 'stream',
+            ...PROXY_NET_OPTS
         });
         res.set('Access-Control-Allow-Origin', '*');
         if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
@@ -1127,13 +1229,18 @@ const builder = new addonBuilder(manifest);
 const inFlightRequests = new Map();
 
 builder.defineStreamHandler(async (args) => {
-    const requestKey = `${args.type}:${args.id}`;
+    // La cuenta la pone el gateway (X-Account-Id) y llega por el contexto de la petición.
+    const store = acctStore.getStore();
+    const acct = store && store.acct;
+    if (!acct) return { streams: [] };
+    // la clave incluye la cuenta: dos cuentas nunca comparten una resolución en curso
+    const requestKey = `${acct}|${args.type}:${args.id}`;
     if (inFlightRequests.has(requestKey)) {
         console.log(`Pedido duplicado detectado para ${requestKey} -- reusando la resolución en curso en vez de arrancar otra.`);
         return inFlightRequests.get(requestKey);
     }
 
-    const resultPromise = resolveStreamRequest(args);
+    const resultPromise = resolveStreamRequest(args, acct);
     inFlightRequests.set(requestKey, resultPromise);
     try {
         return await resultPromise;
@@ -1142,8 +1249,9 @@ builder.defineStreamHandler(async (args) => {
     }
 });
 
-async function resolveStreamRequest(args) {
+async function resolveStreamRequest(args, acct) {
     const [imdbId, season, episode] = args.id.split(':');
+    const meta = { acct, title: args.id };
     
     // Cinemeta puede darnos varias variantes de título (nombre original en inglés,
     // y a veces alternativos). Probamos varias para no depender de un solo idioma.
@@ -1277,7 +1385,8 @@ async function resolveStreamRequest(args) {
                     "PoseidonHD",
                     cleanLabel,
                     vhData.url,
-                    vhData.headers
+                    vhData.headers,
+                    meta
                 );
             }
         }
@@ -1293,7 +1402,8 @@ async function resolveStreamRequest(args) {
                     "PoseidonHD",
                     cleanLabel + "\n(Directo)",
                     swDataFast.url,
-                    swDataFast.headers
+                    swDataFast.headers,
+                    meta
                 );
             }
 
@@ -1307,7 +1417,8 @@ async function resolveStreamRequest(args) {
                     "PoseidonHD",
                     cleanLabel + "\n(Directo)",
                     swDataBrowser.url,
-                    swDataBrowser.headers
+                    swDataBrowser.headers,
+                    meta
                 );
             }
 
@@ -1318,7 +1429,8 @@ async function resolveStreamRequest(args) {
                     "PoseidonHD",
                     cleanLabel + "\n(Directo)",
                     directData.url,
-                    directData.headers
+                    directData.headers,
+                    meta
                 );
             }
             
@@ -1340,6 +1452,17 @@ async function resolveStreamRequest(args) {
 const port = process.env.PORT || 7000;
 
 const app = express();
+
+// Backend cerrado: TODAS las rutas exigen el secreto que pone el gateway.
+// Se responde 404 (no 401) para no delatar que aquí hay algo.
+const GATEWAY_SECRET_HASH = crypto.createHash('sha256').update(GATEWAY_SECRET).digest();
+app.use((req, res, next) => {
+    const got = crypto.createHash('sha256').update(String(req.get('X-Gateway-Secret') || '')).digest();
+    if (!crypto.timingSafeEqual(got, GATEWAY_SECRET_HASH)) return res.status(404).send('Not found');
+    const acct = String(req.get('X-Account-Id') || '');
+    acctStore.run({ acct: /^[A-Za-z0-9_-]{1,40}$/.test(acct) ? acct : '' }, next);
+});
+
 app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
 app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
 
@@ -1347,210 +1470,214 @@ app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
 // Uso: /debug/series?imdb=tt0000000&season=1&episode=1
 // --- DIAGNÓSTICO TEMPORAL para embeds tipo streamwish ---
 // Uso: /debug/embed?url=<link de streamwish.to/e/xxxx o similar>
-app.get('/debug/embed', async (req, res) => {
-    const embedUrl = req.query.url;
-    if (!embedUrl) return res.status(400).send('Falta ?url=');
+// Rutas de diagnóstico: apagadas por defecto. Solo existen con ENABLE_DEBUG=1
+// (y, como todo el backend, siguen exigiendo el secreto del gateway).
+if (ENABLE_DEBUG) {
+    app.get('/debug/embed', async (req, res) => {
+        const embedUrl = req.query.url;
+        if (!embedUrl) return res.status(400).send('Falta ?url=');
 
-    res.set('Content-Type', 'text/plain');
-    const trace = [];
-    const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
-    res.send(trace.join('\n') + '\n\nRESULTADO FINAL: ' + JSON.stringify(result));
-});
-// --- FIN DIAGNÓSTICO TEMPORAL ---
+        res.set('Content-Type', 'text/plain');
+        const trace = [];
+        const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+        res.send(trace.join('\n') + '\n\nRESULTADO FINAL: ' + JSON.stringify(result));
+    });
+    // --- FIN DIAGNÓSTICO TEMPORAL ---
 
-// --- DIAGNÓSTICO TEMPORAL para embeds de Streamwish/hglamioz/playnixes/etc ---
-// Uso: /debug/streamwish?url=<embed url completa, ej: https://hgplaycdn.com/e/xxxx>
-app.get('/debug/streamwish', async (req, res) => {
-    const embedUrl = req.query.url;
-    if (!embedUrl) return res.status(400).send('Falta ?url=<embed completa>');
-    res.set('Content-Type', 'text/plain');
+    // --- DIAGNÓSTICO TEMPORAL para embeds de Streamwish/hglamioz/playnixes/etc ---
+    // Uso: /debug/streamwish?url=<embed url completa, ej: https://hgplaycdn.com/e/xxxx>
+    app.get('/debug/streamwish', async (req, res) => {
+        const embedUrl = req.query.url;
+        if (!embedUrl) return res.status(400).send('Falta ?url=<embed completa>');
+        res.set('Content-Type', 'text/plain');
 
-    const trace = [];
-    const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+        const trace = [];
+        const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
 
-    let fetchTest = 'no se intentó (no hubo resultado)';
-    if (result && result.url) {
-        const t0 = Date.now();
-        try {
-            const r = await axios.get(result.url, {
-                headers: result.headers,
-                timeout: 10000,
-                validateStatus: () => true,
-                responseType: 'text',
-                transformResponse: [(d) => d],
-            });
-            const ms = Date.now() - t0;
-            const preview = typeof r.data === 'string' ? r.data.slice(0, 300) : '(no-texto)';
-            fetchTest = `HTTP ${r.status} en ${ms}ms, pedido ${(Date.now() - t0)}ms después de resolver.\nPrimeros 300 chars del body:\n${preview}`;
+        let fetchTest = 'no se intentó (no hubo resultado)';
+        if (result && result.url) {
+            const t0 = Date.now();
+            try {
+                const r = await axios.get(result.url, {
+                    headers: result.headers,
+                    timeout: 10000,
+                    validateStatus: () => true,
+                    responseType: 'text',
+                    transformResponse: [(d) => d],
+                });
+                const ms = Date.now() - t0;
+                const preview = typeof r.data === 'string' ? r.data.slice(0, 300) : '(no-texto)';
+                fetchTest = `HTTP ${r.status} en ${ms}ms, pedido ${(Date.now() - t0)}ms después de resolver.\nPrimeros 300 chars del body:\n${preview}`;
 
-            // Si el master.m3u8 se pudo leer, seguimos la cadena: sub-playlist
-            // (con y sin headers) y el primer segmento .ts (con y sin headers),
-            // para saber EXACTAMENTE qué nivel exige los headers.
-            if (r.status === 200 && typeof r.data === 'string') {
-                const lines = r.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-                const subLine = lines.find((l) => !l.startsWith('#'));
-                if (subLine) {
-                    const subUrl = new URL(subLine, result.url).href;
+                // Si el master.m3u8 se pudo leer, seguimos la cadena: sub-playlist
+                // (con y sin headers) y el primer segmento .ts (con y sin headers),
+                // para saber EXACTAMENTE qué nivel exige los headers.
+                if (r.status === 200 && typeof r.data === 'string') {
+                    const lines = r.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                    const subLine = lines.find((l) => !l.startsWith('#'));
+                    if (subLine) {
+                        const subUrl = new URL(subLine, result.url).href;
 
-                    const subWith = await axios.get(subUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
-                    const subWithout = await axios.get(subUrl, { timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
-                    fetchTest += `\n\nSub-playlist (${subUrl}):\n  CON headers -> HTTP ${subWith.status}\n  SIN headers -> HTTP ${subWithout.status}`;
+                        const subWith = await axios.get(subUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                        const subWithout = await axios.get(subUrl, { timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                        fetchTest += `\n\nSub-playlist (${subUrl}):\n  CON headers -> HTTP ${subWith.status}\n  SIN headers -> HTTP ${subWithout.status}`;
 
-                    if (subWith.status === 200 && typeof subWith.data === 'string') {
-                        const subLines = subWith.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-                        const segLine = subLines.find((l) => !l.startsWith('#'));
-                        if (segLine) {
-                            const segUrl = new URL(segLine, subUrl).href;
-                            const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
-                            const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
-                            fetchTest += `\n\nSegmento .ts (${segUrl}) [ojo: puede ser un pre-roll de publicidad si el sitio inserta anuncios, no es necesariamente el contenido real]:\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
+                        if (subWith.status === 200 && typeof subWith.data === 'string') {
+                            const subLines = subWith.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                            const segLine = subLines.find((l) => !l.startsWith('#'));
+                            if (segLine) {
+                                const segUrl = new URL(segLine, subUrl).href;
+                                const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                                const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                                fetchTest += `\n\nSegmento .ts (${segUrl}) [ojo: puede ser un pre-roll de publicidad si el sitio inserta anuncios, no es necesariamente el contenido real]:\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
+                            }
                         }
                     }
                 }
+            } catch (e) {
+                fetchTest = `Fetch falló: ${e.message}`;
             }
+        }
+
+        res.send(
+            trace.join('\n') +
+            '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)') +
+            '\n\n--- Test de fetch inmediato desde ESTE server, mismos headers ---\n' + fetchTest
+        );
+    });
+
+    app.get('/debug/movie', async (req, res) => {
+        const imdbId = req.query.imdb;
+        if (!imdbId) return res.status(400).json({ error: 'Falta ?imdb=ttXXXXXXX' });
+        try {
+            const result = await resolveStreamRequest({ type: 'movie', id: imdbId });
+            res.json(result);
         } catch (e) {
-            fetchTest = `Fetch falló: ${e.message}`;
+            res.status(500).json({ error: e.message, stack: e.stack });
         }
-    }
+    });
 
-    res.send(
-        trace.join('\n') +
-        '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)') +
-        '\n\n--- Test de fetch inmediato desde ESTE server, mismos headers ---\n' + fetchTest
-    );
-});
+    app.get('/debug/series', async (req, res) => {
+        const imdbId = req.query.imdb;
+        const season = req.query.season || '1';
+        const episode = req.query.episode || '1';
+        if (!imdbId) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
 
-app.get('/debug/movie', async (req, res) => {
-    const imdbId = req.query.imdb;
-    if (!imdbId) return res.status(400).json({ error: 'Falta ?imdb=ttXXXXXXX' });
-    try {
-        const result = await resolveStreamRequest({ type: 'movie', id: imdbId });
-        res.json(result);
-    } catch (e) {
-        res.status(500).json({ error: e.message, stack: e.stack });
-    }
-});
+        res.set('Content-Type', 'text/plain');
+        const log = [];
+        const p = (label, val) => log.push(label + ': ' + (typeof val === 'object' ? JSON.stringify(val) : val));
 
-app.get('/debug/series', async (req, res) => {
-    const imdbId = req.query.imdb;
-    const season = req.query.season || '1';
-    const episode = req.query.episode || '1';
-    if (!imdbId) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
+        try {
+            const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
+            const meta = metaRes.data && metaRes.data.meta;
+            p('Meta name', meta && meta.name);
+            p('Meta slug', meta && meta.slug);
+            p('Meta aka', meta && meta.aka);
+            p('Meta moviedb_id (TMDB)', meta && meta.moviedb_id);
+            const tmdbIdFromMeta = meta && meta.moviedb_id ? String(meta.moviedb_id) : null;
 
-    res.set('Content-Type', 'text/plain');
-    const log = [];
-    const p = (label, val) => log.push(label + ': ' + (typeof val === 'object' ? JSON.stringify(val) : val));
-
-    try {
-        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
-        const meta = metaRes.data && metaRes.data.meta;
-        p('Meta name', meta && meta.name);
-        p('Meta slug', meta && meta.slug);
-        p('Meta aka', meta && meta.aka);
-        p('Meta moviedb_id (TMDB)', meta && meta.moviedb_id);
-        const tmdbIdFromMeta = meta && meta.moviedb_id ? String(meta.moviedb_id) : null;
-
-        let titleCandidates = [];
-        if (meta) {
-            if (meta.name) titleCandidates.push(meta.name);
-            if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
-            if (meta.slug) {
-                const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
-                if (fromSlug) titleCandidates.push(fromSlug);
+            let titleCandidates = [];
+            if (meta) {
+                if (meta.name) titleCandidates.push(meta.name);
+                if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
+                if (meta.slug) {
+                    const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
+                    if (fromSlug) titleCandidates.push(fromSlug);
+                }
             }
+            titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+            p('Candidatos de título', titleCandidates);
+
+            let searchResults = [];
+            let usedCandidate = null;
+            for (const candidate of titleCandidates) {
+                searchResults = await searchPoseidon2hd(candidate);
+                p('Búsqueda con "' + candidate + '" dio resultados', searchResults.map(r => r.title + ' -> ' + r.url));
+                if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
+            }
+
+            if (!searchResults || searchResults.length === 0) {
+                return res.send(log.join('\n') + '\n\nNO se encontró NADA en ninguna variante de título.');
+            }
+
+            const expectedPath = '/serie/';
+            let target = null;
+            if (tmdbIdFromMeta) {
+                const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
+                target = searchResults.find(r => idRegex.test(r.url)) || null;
+                p('Match exacto por TMDB ID (' + tmdbIdFromMeta + ')', target ? target.url : 'NO encontrado');
+            }
+            if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+            if (!target) return res.send(log.join('\n') + '\n\nNo se encontró ningún resultado.');
+            p('Target elegido', target.url + ' (título: ' + target.title + ')');
+
+            const seriesData = await fetchPoseidonHD2Series(target.url);
+            p('seriesData (tmdbId/slug)', seriesData);
+
+            if (!seriesData || !seriesData.tmdbId || !seriesData.slug) {
+                return res.send(log.join('\n') + '\n\nfetchPoseidonHD2Series no devolvió tmdbId/slug válidos.');
+            }
+
+            const episodeUrl = `https://www.poseidonhd2.co/serie/${seriesData.tmdbId}/${seriesData.slug}/temporada/${season}/episodio/${episode}`;
+            p('URL de episodio construida', episodeUrl);
+
+            const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode, log);
+            p('poseidonData.streams', poseidonData && poseidonData.streams);
+
+            res.send(log.join('\n'));
+        } catch (e) {
+            p('ERROR', e.message);
+            res.status(500).send(log.join('\n'));
         }
-        titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
-        p('Candidatos de título', titleCandidates);
+    });
+    // --- FIN DIAGNÓSTICO TEMPORAL ---
 
-        let searchResults = [];
-        let usedCandidate = null;
-        for (const candidate of titleCandidates) {
-            searchResults = await searchPoseidon2hd(candidate);
-            p('Búsqueda con "' + candidate + '" dio resultados', searchResults.map(r => r.title + ' -> ' + r.url));
-            if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
+    // Test de red simple y directo (sin navegador) para ver si el origen responde
+    // bien a nuestro proxy y qué contenido/status trae realmente.
+    // Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
+    app.get('/debug/nettest', async (req, res) => {
+        const proxyUrl = req.query.url;
+        if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
+
+        const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
+        if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
+
+        const data = decodeProxyToken(m[1]);
+        if (!data) return res.status(400).send('No se pudo decodificar el token');
+
+        res.set('Content-Type', 'text/plain');
+        const start = Date.now();
+        try {
+            const upstream = await axios.get(data.url, {
+                headers: data.headers,
+                timeout: 12000,
+                responseType: 'text',
+                transformResponse: [(d) => d],
+                validateStatus: () => true
+            });
+            res.send(
+                'URL: ' + data.url +
+                '\nTiempo: ' + (Date.now() - start) + 'ms' +
+                '\nStatus: ' + upstream.status +
+                '\nHeaders respuesta: ' + JSON.stringify(upstream.headers, null, 2) +
+                '\n\nPrimeros 800 caracteres del body:\n' + String(upstream.data).slice(0, 800)
+            );
+        } catch (e) {
+            res.send(
+                'URL: ' + data.url +
+                '\nTiempo hasta el error: ' + (Date.now() - start) + 'ms' +
+                '\nError code: ' + (e.code || 'N/A') +
+                '\nError message: ' + e.message
+            );
         }
-
-        if (!searchResults || searchResults.length === 0) {
-            return res.send(log.join('\n') + '\n\nNO se encontró NADA en ninguna variante de título.');
-        }
-
-        const expectedPath = '/serie/';
-        let target = null;
-        if (tmdbIdFromMeta) {
-            const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
-            target = searchResults.find(r => idRegex.test(r.url)) || null;
-            p('Match exacto por TMDB ID (' + tmdbIdFromMeta + ')', target ? target.url : 'NO encontrado');
-        }
-        if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
-        if (!target) return res.send(log.join('\n') + '\n\nNo se encontró ningún resultado.');
-        p('Target elegido', target.url + ' (título: ' + target.title + ')');
-
-        const seriesData = await fetchPoseidonHD2Series(target.url);
-        p('seriesData (tmdbId/slug)', seriesData);
-
-        if (!seriesData || !seriesData.tmdbId || !seriesData.slug) {
-            return res.send(log.join('\n') + '\n\nfetchPoseidonHD2Series no devolvió tmdbId/slug válidos.');
-        }
-
-        const episodeUrl = `https://www.poseidonhd2.co/serie/${seriesData.tmdbId}/${seriesData.slug}/temporada/${season}/episodio/${episode}`;
-        p('URL de episodio construida', episodeUrl);
-
-        const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode, log);
-        p('poseidonData.streams', poseidonData && poseidonData.streams);
-
-        res.send(log.join('\n'));
-    } catch (e) {
-        p('ERROR', e.message);
-        res.status(500).send(log.join('\n'));
-    }
-});
-// --- FIN DIAGNÓSTICO TEMPORAL ---
-
-// Test de red simple y directo (sin navegador) para ver si el origen responde
-// bien a nuestro proxy y qué contenido/status trae realmente.
-// Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
-app.get('/debug/nettest', async (req, res) => {
-    const proxyUrl = req.query.url;
-    if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
-
-    const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
-    if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
-
-    const data = decodeProxyToken(m[1]);
-    if (!data) return res.status(400).send('No se pudo decodificar el token');
-
-    res.set('Content-Type', 'text/plain');
-    const start = Date.now();
-    try {
-        const upstream = await axios.get(data.url, {
-            headers: data.headers,
-            timeout: 12000,
-            responseType: 'text',
-            transformResponse: [(d) => d],
-            validateStatus: () => true
-        });
-        res.send(
-            'URL: ' + data.url +
-            '\nTiempo: ' + (Date.now() - start) + 'ms' +
-            '\nStatus: ' + upstream.status +
-            '\nHeaders respuesta: ' + JSON.stringify(upstream.headers, null, 2) +
-            '\n\nPrimeros 800 caracteres del body:\n' + String(upstream.data).slice(0, 800)
-        );
-    } catch (e) {
-        res.send(
-            'URL: ' + data.url +
-            '\nTiempo hasta el error: ' + (Date.now() - start) + 'ms' +
-            '\nError code: ' + (e.code || 'N/A') +
-            '\nError message: ' + e.message
-        );
-    }
-});
+    });
+}
 
 app.use(getRouter(builder.getInterface()));
 
 app.listen(port, () => {
     console.log(`Addon de Stremio escuchando en puerto ${port}`);
-    console.log(`PUBLIC_URL usada para el proxy de HLS: ${PUBLIC_URL}`);
+    console.log(`Playlists por el gateway: ${PLAYLIST_BASE_URL}`);
 });
 
 async function shutdown() {
